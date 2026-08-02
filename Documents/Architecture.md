@@ -151,7 +151,8 @@ Environment variables (never in code):
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 ```
 
-Render provides: auto-HTTPS, health check, restart-on-crash, deploys from `main`.
+Render provides: auto-HTTPS, health check, restart-on-crash, deploys from `prod`
+(this repo uses dev → staging → prod; `prod` is the only live deployment source).
 Managed Postgres provides: backups, scaling, no manual maintenance. This keeps the volunteer's
 ops burden near zero (NFR-2).
 

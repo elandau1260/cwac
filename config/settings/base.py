@@ -20,7 +20,10 @@ env = environ.Env(
 # Read a local .env file if present (dev convenience). No-op in prod where it's absent.
 environ.Env.read_env(str(BASE_DIR / ".env"))
 
-SECRET_KEY = env("SECRET_KEY", default="dev-insecure-change-me")
+# Placeholder used ONLY so local dev runs out of the box without a SECRET_KEY. Production
+# (config/settings/prod.py) fails closed if this value is ever present there.
+INSECURE_DEV_SECRET_KEY = "dev-insecure-change-me"
+SECRET_KEY = env("SECRET_KEY", default=INSECURE_DEV_SECRET_KEY)
 DEBUG = env("DEBUG")
 ALLOWED_HOSTS = env("ALLOWED_HOSTS")
 

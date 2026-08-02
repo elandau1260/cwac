@@ -1,5 +1,6 @@
 # Render Blueprint for CWAC.
-# Web service (Django + gunicorn) + managed Postgres. Deployed from the `main` branch.
+# Web service (Django + gunicorn) + managed Postgres. Deployed from the `prod` branch
+# (this repo uses dev -> staging -> prod; only `prod` is the live deployment source).
 #
 # The hourly cron job for `run_due_lotteries` (R-4 auto-lottery fallback) is added in
 # Phase 5/11, once that management command exists.
@@ -8,6 +9,7 @@ services:
     name: cwac
     runtime: python
     plan: starter
+    branch: prod
     buildCommand: pip install -r requirements/prod.txt && python manage.py collectstatic --noinput
     startCommand: gunicorn config.wsgi --log-file -
     preDeployCommand: python manage.py migrate
@@ -43,4 +45,4 @@ services:
 databases:
   - name: cwac-db
     databaseName: cwac
-    plan: starter
+    plan: basic-256mb   # current entry-level managed Postgres plan (`starter` is legacy)
