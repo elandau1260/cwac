@@ -16,7 +16,8 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.http import HttpResponse
-from django.urls import path
+from django.urls import path, reverse_lazy
+from django.views.generic import RedirectView
 
 
 def healthz(request):
@@ -25,6 +26,9 @@ def healthz(request):
 
 
 urlpatterns = [
+    # Root -> admin. The public owner form lives at /r/<slug>/ (added in Phase 3); /
+    # itself isn't a page anyone needs to land on, so point the bare domain at login.
+    path("", RedirectView.as_view(url=reverse_lazy("admin:index")), name="home"),
     path("healthz/", healthz, name="healthz"),
     path("admin/", admin.site.urls),
 ]
