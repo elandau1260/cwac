@@ -1,0 +1,46 @@
+# Render Blueprint for CWAC.
+# Web service (Django + gunicorn) + managed Postgres. Deployed from the `main` branch.
+#
+# The hourly cron job for `run_due_lotteries` (R-4 auto-lottery fallback) is added in
+# Phase 5/11, once that management command exists.
+services:
+  - type: web
+    name: cwac
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements/prod.txt && python manage.py collectstatic --noinput
+    startCommand: gunicorn config.wsgi --log-file -
+    preDeployCommand: python manage.py migrate
+    healthCheckPath: /healthz/
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.prod
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALLOWED_HOSTS
+        value: cwac.onrender.com   # change to your custom domain when known
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cwac-db
+          property: connectionString
+      - key: SMS_BACKEND
+        value: twilio
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+
+databases:
+  - name: cwac-db
+    databaseName: cwac
+    plan: starter
