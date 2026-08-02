@@ -28,7 +28,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ## Decision 4 — AnimalID assignment (FR-14)
 **Decision:** The lottery **randomly selects** people (not in signup order, so people who borrowed a phone aren't disadvantaged), then assigns **sequential AnimalIDs starting at 1** (1, 2, 3, …), **max 999**, to selected + waitlisted. Manual admin additions take the next available number. Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next animal." Uniqueness is DB-enforced.
 **Your answer:** ✅ Confirmed — random selection + sequential IDs.
-🔶 **Open sub-point:** start value — you said "1" earlier and "0" most recently. Docs currently use **1**. Confirm 0 or 1?
+✅ **Confirmed:** start value is **1** (sequential 1, 2, 3, …; max 999). Resolved 2026-08-02 — matches the Implementation Plan, Requirements, and the data model (`next_animal_id` = max+1 else 1).
 
 ---
 
@@ -63,4 +63,4 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Summary
-All decisions confirmed except the **AnimalID start value (0 vs 1)** under Decision 4 — awaiting your nod.
+All decisions confirmed. AnimalIDs start at **1** (Decision 4) — no open items remain for V1.
