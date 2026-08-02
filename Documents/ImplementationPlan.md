@@ -5,7 +5,7 @@
 
 ## Context
 
-Anika's community vet clinics (City of Oakland) are oversubscribed — owners line up before 9am and
+The Admin's community vet clinics (City of Oakland) are oversubscribed — owners line up before 9am and
 still aren't seen. This app replaces "first in line" with a **fair lottery** and collects owner/pet
 info ahead of time so **check-in is fast and labels print** instead of being hand-written onto
 consent forms.
@@ -127,10 +127,15 @@ migration is made.
 ## Key behavioral designs
 
 ### Lottery (`lottery/services.py`) — pure, injectable RNG
-`run_lottery(event, *, rng=None, commit=True) → LotteryResult`. Guarded: raises if
-`event.lottery_run_at is not None` (single run, Decision 6). In one `transaction.atomic()` with
-`select_for_update()` on the event's `registered` rows:
+`run_lottery(event, *, rng=None, commit=True) → LotteryResult`. **Concurrency-safe single run:**
+the whole body runs inside one `transaction.atomic()`. It first **locks and reloads the `Event`
+row** (`Event.objects.select_for_update().get(pk=event.pk)`), then performs the single-run guard
+on that locked row — `raise LotteryAlreadyRun if event.lottery_run_at is not None` (Decision 6).
+Locking the Event row (not just the registrations) is what makes a manual click and the noon cron
+unable to double-run: the second caller blocks until the first commits, re-reads a non-null
+`lottery_run_at`, and exits (TC-050). Then `select_for_update()` on the event's `registered` rows:
 
+0. Reload + lock the `Event` row; guard `lottery_run_at is None` (single run).
 1. `rng.shuffle(regs)` — random, **not** signup order (TC-013). Default `rng = random.Random()`.
 2. Single pass, tagging each reg's bucket: while `sel_total < x_seen` → `selected` (+n animals);
    elif `wl_total < y_waitlist` → `waitlisted` (+n); else `not_selected`.
@@ -148,13 +153,14 @@ Admin trigger: a Django admin **action "Run lottery"** on the Event changelist (
 uniform selection frequency and that different seeds differ.
 
 **Hybrid trigger (R-4):** the lottery runs either (a) **manually** via the admin action above, or
-(b) **automatically if not yet run by noon on the calendar day after `close_at`** (so Anika can't
-forget — and noon keeps result texts civilized). Both paths call the same idempotent
-`run_lottery(event)` (guarded by `lottery_run_at`, so they can't double-run). The auto path is a
-`manage.py run_due_lotteries` command that runs every event past its
-`auto_run_deadline` (= noon in the **event's per-event `timezone` field**, day after `close_at`;
-`USE_TZ=True`, store UTC) and not yet run. Wire it to a **Render Cron Job (hourly)** as the reliable primary, plus
-an **admin "overdue lottery" warning + one-click run** banner as a no-cron fallback.
+(b) **automatically if not yet run by noon on the calendar day after `close_at`** (so the Admin
+can't forget — and noon keeps result texts civilized). Both paths call the same `run_lottery(event)`,
+whose Event-row lock + post-lock guard (above) mean a concurrent manual click and cron run
+**cannot double-run** (TC-050). The auto path is a `manage.py run_due_lotteries` command that runs
+every event past its `auto_run_deadline` (= noon in the **event's per-event `timezone` field**,
+day after `close_at`; `USE_TZ=True`, store UTC) and not yet run. Wire it to a **Render Cron Job
+(hourly)** as the reliable primary, plus an **admin "overdue lottery" warning + one-click run**
+banner as a no-cron fallback.
 
 ### Window / open-close
 All gating calls `event.signup_open()` / `owner_can_add()` / `owner_can_edit()` — never the raw
@@ -176,8 +182,8 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
 - **#2 result** (after lottery, to **every** registrant — FR-17/19, TC-017/018/019): selected →
   "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]"; not_selected →
   courtesy text, **no link**.
-- Edit link in **both** SMS: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))`.
-- Per-reg try/except + logging so one Twilio failure doesn't abort the batch (Architecture §12). Notify is **idempotent** (a per-registration `result_sms_sent_at` guard) so manual + cron + retry never double-text, and sends are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron window.
+- Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (everyone)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
+- Notify is **idempotent via an atomic DB claim**: `Registration.objects.filter(pk=reg.pk, result_sms_sent_at__isnull=True).update(result_sms_sent_at=now())` — send only if exactly one row was updated, so manual + cron + retry never double-text (Architecture §12; TC-050). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron window.
 
 ### i18n
 Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. EN/ES
@@ -187,9 +193,16 @@ toggle via `?lang=<code>` setting the `django_language` cookie; the chosen value
 ### Owner form (dynamic formset)
 `OwnerForm` (all owner fields required — TC-007; phone validated/normalized). `AnimalForm(event=…)`
 conditionally shows `last_vaccinated_date` (if vaccination), `medical_concern` (if vet), and one
-checkbox per offered service (TC-009/010). `formset_factory(AnimalForm, extra=1, max_num=N,
-validate_max=True)` where **N=6 for owner self-signup/edit** and **N=None for admin/volunteer**
-(cap not enforced — FR-10/36). 7→blocked, 6→ok (TC-008).
+checkbox per offered service (TC-009/010). `formset_factory(AnimalForm, extra=1, min_num=1,
+validate_min=True, max_num=N, validate_max=True)`:
+
+- **`min_num=1, validate_min=True`** — a registration must contain **≥1 animal** (FR-7); a
+  zero-animal submission is rejected (TC-051).
+- **Owner self-signup/edit:** `N = max(6, existing_animal_count)`. New owners are capped at 6
+  (FR-10; 7→blocked, 6→ok, TC-008), and the cap tracks the current count so an owner can still
+  **edit/remove** a record a volunteer previously grew past 6 (TC-052) — only **additions beyond 6**
+  are blocked.
+- **Admin/volunteer:** `N=None` (cap not enforced — FR-10/36).
 
 ### Print payload + browser stub (`printing/`)
 - `label_payload(event_slug, animal_id)` → JSON (login required): `registration` summary + `owner_label`
@@ -206,7 +219,7 @@ validate_max=True)` where **N=6 for owner self-signup/edit** and **N=None for ad
 `export_event(event_slug, fmt)` (login required). CSV via `csv.writer` + `StreamingHttpResponse`;
 XLSX via `openpyxl` → `BytesIO`. Columns: owner first/last name, phone, address, email; per animal
 name, species, age, sex, breed, color, services; plus status, AnimalID, language, printed.
-**Default = one row per animal** (owner + AnimalID repeated — best for Anika's per-animal vaccine
+**Default = one row per animal** (owner + AnimalID repeated — best for the Admin's per-animal vaccine
 notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-032).
 
 ---
@@ -244,7 +257,8 @@ contiguous, max 999). `run_lottery(event, rng=random.Random(seed))` makes these 
 Other automatable: TC-002 (slug), TC-004 (window), TC-007/008 (validation + cap), TC-016/017/018/019
 (SMS via locmem), TC-031 (payload shape), TC-032 (export columns), TC-039 (env creds), TC-041
 (post-close add blocked), TC-043 (printed_at), TC-044/045 (manual entry + AnimalID), TC-046
-(language stored). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
+(language stored), TC-047 (applicant cap Z), TC-048 (event deletion), TC-049 (noon auto-run),
+TC-050 (no concurrent double-run), TC-051 (≥1 animal), TC-052 (over-cap owner edit). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
 
 ---
 
@@ -285,13 +299,14 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   admin-driven stages; the **displayed** open/closed label is computed live from
   `open_at`/`close_at`/`lottery_run_at`. So the admin always sees reality — no drift, no cron needed.
   (Never a correctness bug; now not even a cosmetic one.)
-- **R-4 Lottery trigger — RESOLVED (hybrid).** Runs when Anika clicks "Run lottery" **or**
-  automatically if not yet run by **noon on the day after `close_at`** (so she can't forget, and the
-  result texts still go out at a civilized hour). Both paths call one idempotent `run_lottery`
-  (guarded by `lottery_run_at`). Auto path = `run_due_lotteries` command on a Render Cron Job
-  (hourly) + an admin "overdue lottery" warning/one-click-run banner as a no-cron fallback. Result
-  SMS is idempotent (`result_sms_sent_at`) + concurrent so ~Z texts finish quickly and never
-  double-send.
+- **R-4 Lottery trigger — RESOLVED (hybrid).** Runs when the Admin clicks "Run lottery" **or**
+  automatically if not yet run by **noon on the day after `close_at`** (so the Admin can't forget,
+  and the result texts still go out at a civilized hour). Both paths call one `run_lottery` that
+  **locks the Event row inside the transaction and re-checks `lottery_run_at` after the lock**, so a
+  concurrent manual click and cron run cannot double-run (TC-050). Auto path = `run_due_lotteries`
+  command on a Render Cron Job (hourly) + an admin "overdue lottery" warning/one-click-run banner as
+  a no-cron fallback. Result SMS is idempotent via an atomic per-reg claim (`result_sms_sent_at`) +
+  concurrent so ~Z texts finish quickly and never double-send.
 - **R-5 Check-in concurrency — RESOLVED.** One volunteer/printer is the norm; two+ volunteers with
   two printers also work cleanly — that's exactly why Postgres (not SQLite). Duplicate AnimalIDs are
   blocked by the unique index; two volunteers editing the same registration is last-write-wins and
@@ -313,7 +328,7 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   registrations/owners allowed; **admin-configured per event (no hardcoded value)**. Once reached,
   new signups are rejected with a friendly EN/ES "registration is full" message. Gates only
   brand-new registrations (existing owners may still add animals).
-- **R-11 Twilio cost/consent — to confirm with Anika.** 2 SMS/registrant × up to Z/event; budget +
+- **R-11 Twilio cost/consent — to confirm with the Admin.** 2 SMS/registrant × up to Z/event; budget +
   opt-out wording. The Z cap (R-10) bounds the blast.
 
 ---

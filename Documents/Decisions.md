@@ -62,5 +62,29 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 
 ---
 
+## Decision 10 — Lottery trigger (FR-40; plan R-4)
+**Decision:** **Hybrid.** The admin runs the lottery manually, **or** it runs automatically at noon (in the event's timezone) on the calendar day after `close_at` if not yet run — so it can't be forgotten and result texts stay civilized. Both paths call one concurrency-safe `run_lottery` (Event-row lock + post-lock guard) that cannot double-run.
+**Your answer:** ✅ Confirmed — hybrid (manual + noon auto-run).
+
+---
+
+## Decision 11 — Event deletion / retention (FR-39; plan R-9)
+**Decision:** The admin may **delete an entire event** (cascade to all registrations/animals) from the event selector / Django admin, behind a confirmation warning. Otherwise event data is retained; there is no automatic expiry.
+**Your answer:** ✅ Confirmed — admin delete behind a confirmation.
+
+---
+
+## Decision 12 — Applicant cap Z (FR-38; plan R-10)
+**Decision:** Per-event **Z** (max registrations/owners), admin-configured alongside X and Y. Once reached, new signups are rejected with a friendly EN/ES "full" message. Gates only brand-new signups — existing owners may still add animals.
+**Your answer:** ✅ Confirmed — per-event applicant cap Z.
+
+---
+
+## Decision 13 — Twilio cost / consent / opt-out wording (plan R-11)
+**Decision:** 🔶 **Pending.** 2 SMS/registrant × up to Z/event; the budget and the SMS opt-out wording need the Admin's confirmation before launch. The Z cap (Decision 12) bounds the blast.
+**Your answer:** 🔶 Awaiting confirmation.
+
+---
+
 ## Summary
-All decisions confirmed. AnimalIDs start at **1** (Decision 4) — no open items remain for V1.
+Decisions 1–12 are confirmed. The only open item is **Decision 13 (Twilio cost/consent/opt-out wording)** — pending the Admin's confirmation before launch. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, and applicant cap Z (Decisions 10–12) are reflected in Requirements/Architecture/Traceability as **FR-38/FR-39/FR-40**.

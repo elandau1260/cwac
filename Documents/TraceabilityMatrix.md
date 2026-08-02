@@ -18,17 +18,20 @@ are in §2.
 | **FR-3** | Download sign-up URL + QR-code JPG | TC-003 |
 | **FR-4** | Lifecycle; signups only during [open_at, close_at) (auto, no manual lock) | TC-004 |
 | **FR-34** | After close_at: owners edit/remove only (no add); admin can always add/edit | TC-041 |
+| **FR-38** | Per-event applicant cap Z rejects new signups when full (existing owners can still add) | TC-047 |
+| **FR-39** | Admin can delete an entire event (cascade) behind a confirmation | TC-048 |
 | **FR-5** | Public form via event URL, no login | TC-005 |
 | **FR-6** | EN/ES language toggle | TC-006 |
-| **FR-7** | Owner info (all required) + animals submitted | TC-007, TC-008 |
+| **FR-7** | Owner info (all required) + ≥1 animal submitted | TC-007, TC-008, TC-051 |
 | **FR-8** | Per-animal fields; no weight | TC-009 |
 | **FR-9** | Per-animal services/questions from event config | TC-010 |
-| **FR-10** | Max 6 animals enforced during open window | TC-008 |
+| **FR-10** | Max 6 animals enforced on owner additions during open window (edit-form max tracks current count) | TC-008, TC-052 |
 | **FR-11** | Confirmation screen (no guaranteed time) | TC-011 |
-| **FR-12** | Lottery randomly selects whole registrations (single run, after close) | TC-012, TC-013 |
+| **FR-12** | Lottery randomly selects whole registrations (single run, after close; no double-run under concurrent manual+auto) | TC-012, TC-013, TC-050 |
 | **FR-13** | X/Y caps (may overshoot ≤ max animals/person) | TC-012 |
 | **FR-14** | AnimalID sequential from 1 (max 999) to selected + waitlisted | TC-014, TC-015 |
 | **FR-15** | Statuses set correctly | TC-014 |
+| **FR-40** | Lottery auto-runs at noon (event tz) day-after-close if not run manually (single-run) | TC-049, TC-050 |
 | **FR-16** | Signup-confirmation SMS immediately on register (with edit link) | TC-016 |
 | **FR-17** | Lottery-result SMS to all; selected/waitlisted include AnimalID | TC-017, TC-018 |
 | **FR-18** | SMS in the language stored on the registration | TC-018, TC-046 |
@@ -80,7 +83,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-015 | U | AnimalIDs are sequential starting at 1 (1..N), contiguous, max 999, unique within the event. |
 | TC-016 | I | On signup (Twilio mocked) → a confirmation SMS is sent to the registrant containing an edit link. |
 | TC-017 | I | On lottery (Twilio mocked) → a result SMS is sent to **every** registrant; selected/waitlisted bodies contain the AnimalID + edit link; not-selected bodies are the courtesy text; wording differs by outcome. |
-| TC-018 | I | A registration whose owner chose ES → both SMS bodies rendered in Spanish; edit links in SMS #1 and #2 resolve to the entry. |
+| TC-018 | I | A registration whose owner chose ES → both SMS bodies rendered in Spanish; the edit link appears in SMS #1 (and in SMS #2 for selected/waitlisted only); links resolve to the entry. |
 | TC-019 | I | A not-selected registrant receives exactly one courtesy lottery SMS (no AnimalID). |
 | TC-020 | E2E | Open a valid edit-token link while logged out → entry loads (no login). |
 | TC-021 | E2E | Owner edits an owner field + saves → change persists on reload. |
@@ -109,12 +112,18 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-044 | I | Admin creates a registration manually (owner + animals) → saved with `created_by`=admin; lookup-able by name/phone; the 6-animal cap is not enforced. |
 | TC-045 | I | Admin assigns an AnimalID to a registration → accepted if unique within the event (1..999); a duplicate is rejected; the entry is then lookup-able by that AnimalID. |
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
+| TC-047 | I | With Z reached, a new signup is rejected with an EN/ES "registration full" message; an existing owner at the event can still add an animal. |
+| TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
+| TC-049 | I | `run_due_lotteries` runs an event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched. |
+| TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same event → exactly one run wins (statuses/IDs set once); each registrant gets exactly one result SMS (idempotent). |
+| TC-051 | I | Submitting a registration with zero animals → blocked (≥1 animal required); submit with 1 → accepted. |
+| TC-052 | I | An owner record a volunteer grew to 8 animals can still be edited/removed by the owner (max tracks current count); an owner at 6 cannot add a 7th. |
 
 ---
 
 ## 3. Notes
 
-- **Coverage:** every FR-1..FR-37 and NFR-1..NFR-4 has ≥1 test case (see §1).
+- **Coverage:** every FR-1..FR-40 and NFR-1..NFR-4 has ≥1 test case (see §1).
 - **Two-SMS flow:** signup confirmation (TC-016) and lottery result (TC-017/018/019) are tested
   separately; Twilio is mocked in integration tests.
 - **Window/close semantics:** TC-004 (window boundary) and TC-041/TC-042 (after close: signups
@@ -124,8 +133,12 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 - **Attendance:** TC-043 verifies printing records attendance (FR-35).
 - **Admin manual ops:** TC-044 (create entry) and TC-045 (assign AnimalID) cover the post-lottery
   edge-case handling in FR-36/FR-37.
+- **Applicant cap / deletion / auto-lottery:** TC-047 (cap Z), TC-048 (event deletion), and
+  TC-049/TC-050 (noon auto-run + no concurrent double-run) cover FR-38..FR-40.
+- **Formset invariant:** TC-051 (≥1 animal required) and TC-052 (over-cap owner edit) cover
+  FR-7/FR-10/FR-21.
 - **Labels:** TC-031/TC-040 verify grouped pet labels (~3/label), not one-per-animal.
 - **Test automation targets:** unit (TC-002, TC-009, TC-012, TC-013, TC-015) and integration
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
-  TC-043, TC-044, TC-045, TC-046) should be automated. E2E (browser) and manual/deploy tests are
-  run before each release.
+  TC-043, TC-044, TC-045, TC-046, TC-047, TC-048, TC-049, TC-050, TC-051, TC-052) should be
+  automated. E2E (browser) and manual/deploy tests are run before each release.

@@ -8,7 +8,7 @@
 
 ## 1. Overview / Vision
 
-A simple web app for Anika's community vet clinics (City of Oakland). The clinics are
+A simple web app for the Admin's community vet clinics (City of Oakland). The clinics are
 oversubscribed — people line up before 9am and still don't get seen. This app replaces
 "first in line" with a **fair lottery**, and collects owner/pet information ahead of time so
 that **check-in is fast and labels can be printed** instead of hand-written onto consent forms.
@@ -53,21 +53,23 @@ AnimalID, edits as needed, and **prints labels**.
 | Role | Who | Can do |
 |---|---|---|
 | **Owner** (public, no login) | Pet owner registering on their phone | Register (during open window), edit own entry via SMS link |
-| **Admin** | Anika | Create/configure events, run lottery, manually add entries & assign IDs, view & export data, edit any entry |
+| **Admin** | Admin | Create/configure events, run lottery, manually add entries & assign IDs, view & export data, edit any entry |
 | **Volunteer** | Clinic staff at check-in | Look up, edit (incl. add animals), print labels, export |
 
 > **Note:** In V1, Admin and Volunteer have the **same privileges**. The role label exists for
-> clarity/logging only. (Reverses Anika's "no edit" idea from the email — editing at the clinic
+> clarity/logging only. (Reverses the Admin's "no edit" idea from the email — editing at the clinic
 > is required for real-world cases like "registered 4, showed with 1".)
 
 ---
 
 ## 4. Key Concepts / Glossary
 
-- **Event** — one clinic day. Lifecycle:
-  `draft → open → closed → lottery_run → active → completed`.
-  The `open`↔`closed` transition is governed by `open_at`/`close_at` (timestamp-driven, **no
-  manual lock**); running the lottery, activation, and completion are admin actions.
+- **Event** — one clinic day. **Stored lifecycle (admin-driven stages):**
+  `draft → live → lottery_run → active → completed`. Separately, whether the form is **open** or
+  **closed** for new signups is a **computed, read-time label** derived from `open_at`/
+  `close_at`/`lottery_run_at` (R-3) — it is **never stored**. The form accepts new signups only
+  during `[open_at, close_at)` and before the lottery runs; running the lottery, activation, and
+  completion are admin actions (timestamp-driven, **no manual lock** — Decision 8).
 - **Open window** — the period `[open_at, close_at)` during which the public form accepts new
   signups **and** owners can add animals.
 - **Close** — at `close_at` the form stops accepting new signups and owner animal-add is disabled
@@ -100,8 +102,9 @@ AnimalID, edits as needed, and **prints labels**.
 | `open_at`, `close_at` | The signup window. Close is automatic; no manual lock. Admin may adjust these times. |
 | `x_seen` | Number of animals to be seen |
 | `y_waitlist` | Number of animals on the waitlist |
+| `z_applicants` | Max registrations (owners) per event (FR-38); admin-configured. Gates only brand-new signups (existing owners may still add animals). |
 | `services_offered` | Subset of: `flea_deworming`, `microchip`, `vaccination`, `vet` |
-| `status` | `draft` → `open` → `closed` → `lottery_run` → `active` → `completed` (open↔closed driven by `open_at`/`close_at`) |
+| `status` | Stored stages `draft` → `live` → `lottery_run` → `active` → `completed`; the **open↔closed** label is computed from `open_at`/`close_at`/`lottery_run_at`, never stored (R-3) |
 | `languages` | `EN`, `ES` (which the public form offers) |
 
 ### Registration (one per owner per event)
@@ -127,9 +130,12 @@ AnimalID, edits as needed, and **prints labels**.
 | `last_vaccinated_date` | Asked if vaccination offered |
 | `medical_concern` | Free text, asked if vet offered |
 
-> **No weight** in V1 (per Anika). Max **6 animals** per registration enforced **during the open
-> window** (the cap does not block a volunteer or admin adding manually). Services offered vary
-> per event, so the per-animal form is built dynamically from `event.services_offered`.
+> **No weight** in V1 (per the Admin). A registration requires **at least 1 animal** (FR-7), and
+> **max 6 animals** is enforced for **owner** self-signup/edit during the open window. The cap
+> blocks owner **additions** beyond 6 but never a volunteer/admin adding manually, and an owner
+> may still edit/remove a record that a volunteer previously grew past 6 (the edit form's max
+> tracks the current count). Services offered vary per event, so the per-animal form is built
+> dynamically from `event.services_offered`.
 
 ### User (admin / volunteer)
 `username`, hashed `password`, `role` (label only — same privileges in V1).
@@ -141,7 +147,7 @@ AnimalID, edits as needed, and **prints labels**.
 When creating an event, the admin sets:
 - Name, description, date, location
 - **Open and close times** (`open_at`, `close_at`) — the signup window
-- **X** (animals seen) and **Y** (waitlist animals)
+- **X** (animals seen), **Y** (waitlist animals), and **Z** (max registrations/owners — FR-38)
 - Services offered (checkboxes for flea/deworming, microchip, vaccination, vet — excludes
   grooming and spay/neuter, which are handled elsewhere)
 - Languages offered (EN/ES)
@@ -170,7 +176,10 @@ At `close_at` the form stops accepting new signups. Owners can still **edit/remo
 their edit link, but can no longer **add**. The admin can always add/edit.
 
 ### 7.4 Lottery runs → result SMS
-Admin runs the lottery (**single run, after close**):
+The lottery runs **once**, after close. The admin runs it manually — **or**, if it hasn't been
+run by **noon (in the event's timezone) on the calendar day after `close_at`**, it runs
+**automatically** (FR-40) so it can't be forgotten and result texts still go out at a civilized
+hour. Both paths call the same single-run routine and cannot double-run. The algorithm:
 1. **Randomly shuffle** all registrations (selection is random, not signup order).
 2. Walk the list assigning **selected** and accumulating animal counts until the selected total
    reaches **X** (may overshoot by up to 6).
@@ -191,7 +200,7 @@ couldn't register online), the admin can **manually create registrations** (owne
 sequence per event (the database enforces uniqueness within the event).
 
 ### 7.5 Owner edits via SMS link
-The edit link (`/r/EVENT/edit/TOKEN`) — sent in **both** SMS #1 and SMS #2 — opens their entry
+The edit link (`/r/EVENT/edit/TOKEN`) — sent in **SMS #1 to everyone**, and in **SMS #2 only to selected/waitlisted** — opens their entry
 without login. They can edit owner + animal fields and **remove** animals at any time. They can
 **add** animals **only while the window is open** (disabled after `close_at`). Once the
 registration is **checked-in** (or the event completes), self-edit locks.
@@ -214,7 +223,7 @@ loads. Volunteer can:
 ### 7.7 Admin export
 Admin downloads all registrations for an event as **Excel/CSV** (columns: owner name, phone,
 address, email; per animal: name, species, age, sex, breed, color, services; plus status,
-AnimalID, language, and `printed`). Anika uses this offline to cross-reference vaccines due in
+AnimalID, language, and `printed`). The Admin uses this offline to cross-reference vaccines due in
 PetPoint.
 
 ---
@@ -274,8 +283,9 @@ website and exposes the existing native `printLabel` channel to the page via a J
 
 - Collects PII (name, phone, email, address). Keep behind HTTPS and the admin login.
 - No public listing of registrations.
-- Retention: keep event data as long as Anika needs it for records; a cleanup policy can be
-  decided later.
+- Retention: the admin may **delete an entire event** (FR-39) — cascading to all of its
+  registrations and animals — from the event selector / Django admin, behind a confirmation
+  warning. Otherwise event data is retained for records; there is no automatic expiry.
 
 ---
 
@@ -292,6 +302,10 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ Registration open/close → **timestamp-driven (`open_at`/`close_at`); no manual lock** (Decision 8)
 - ✅ Pet labels → grouped (~3/label, exact count set by print testing) (Decision 9)
 - ✅ Track the owner's chosen language → stored on registration, drives SMS language
+- ✅ Lottery trigger → **hybrid**: admin runs it, or it auto-runs at noon (event tz) the day
+  after `close_at` if not yet run (FR-40; plan R-4)
+- ✅ Event deletion → admin can delete an entire event behind a confirmation (FR-39; plan R-9)
+- ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10)
 
 ---
 
@@ -315,8 +329,10 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-1** Admin can create an event with full configuration (name, description, date, location, open/close times, X, Y, services offered, languages).
 - **FR-2** Each event has a unique sign-up URL/slug.
 - **FR-3** Admin can download the sign-up URL and a QR-code JPG.
-- **FR-4** Event lifecycle (`draft → open → closed → lottery_run → active → completed`); the form accepts new signups only during `[open_at, close_at)`; open↔closed is timestamp-driven (no manual lock).
+- **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at`/`lottery_run_at` and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` and before the lottery runs (timestamp-driven, no manual lock).
 - **FR-34** After `close_at`, owners can edit/remove but **not add** animals; the admin can always add/edit regardless of state.
+- **FR-38** Per-event **applicant cap Z** (admin-configured max registrations/owners). Once reached, **new** signups are rejected with a friendly EN/ES "registration full" message; existing owners may still add animals.
+- **FR-39** Admin can **delete an entire event** (cascade to all its registrations/animals) from the event selector / Django admin, behind a confirmation warning.
 
 **Owner registration (public, no login)**
 - **FR-5** Public form accessible via the event URL/QR (during the open window).
@@ -332,15 +348,16 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-13** Selected count targets X, waitlist targets Y (each may overshoot by ≤ max animals/person).
 - **FR-14** **AnimalID assigned sequentially from 1** (max 999), in shuffled order, to each selected + waitlisted registration; unique within the event.
 - **FR-15** Statuses set: `selected` / `waitlisted` / `not_selected`.
+- **FR-40** If the lottery has not been run manually, it **runs automatically at noon (in the event's timezone) on the calendar day after `close_at`** (single-run; cannot double-run with a manual run).
 
 **SMS (Twilio)**
 - **FR-16** Send a **signup-confirmation SMS immediately on registration**, containing an edit link.
-- **FR-17** After the lottery, send a **result SMS to every registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link.
+- **FR-17** After the lottery, send a **result SMS to every registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**.
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** registrants receive a courtesy result SMS (Decision 1).
 
 **Owner edit (token)**
-- **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent at signup and at lottery).
+- **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to everyone; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
 - **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed); admin can always add.
 - **FR-22** Edit link valid from signup **until the registration is checked-in or the event completes**.
 
