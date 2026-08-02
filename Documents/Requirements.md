@@ -117,6 +117,7 @@ AnimalID, edits as needed, and **prints labels**.
 | `edit_token` | For the SMS edit link (created at signup) |
 | `language` | **EN/ES the owner chose at signup — drives the SMS language** |
 | `printed_at` | Set when labels print = owner showed up (nullable) |
+| `sms_opt_out` | Boolean (default **false**). Set by the signup consent checkbox (FR-42); when true, no SMS is sent — the owner tracks status via the edit link (FR-41) |
 | **Owner fields (all required)** | first name, last name, phone, email, address |
 | `created_at`, `updated_at`, `created_by` | owner (self) vs admin/volunteer |
 
@@ -166,10 +167,13 @@ URL + QR code for the flyer. The form is live during `[open_at, close_at)`.
 
 ### 7.2 Owner pre-registers → signup SMS
 Owner opens the sign-up URL/QR (during the open window) → picks language → enters owner info
-(name, phone, email, address — all required) + animals + per-animal services/questions → submits
-→ sees a confirmation screen **and immediately receives SMS #1**: *"You're registered for
-[Event]. Edit your info/animals here: [edit link]. We'll text you when the lottery runs."* No
-guaranteed time is stated. The chosen language is saved on the registration.
+(name, phone, email, address — all required) + animals + per-animal services/questions →
+**checks/unchecks an SMS-consent box ("Send me updates by text", checked by default — FR-42)** →
+submits → sees a confirmation screen. If they left the box checked, they **immediately receive SMS
+#1**: *"You're registered for [Event]. Edit your info/animals here: [edit link]. We'll text you when
+the lottery runs."* (If unchecked, no SMS — the edit link is shown on-screen so they can still
+return, and they can re-consent later via the edit link.) No guaranteed time is stated. The chosen
+language is saved on the registration.
 
 ### 7.3 Registration closes (automatic)
 At `close_at` the form stops accepting new signups. Owners can still **edit/remove** animals via
@@ -204,6 +208,13 @@ The edit link (`/r/EVENT/edit/TOKEN`) — sent in **SMS #1 to everyone**, and in
 without login. They can edit owner + animal fields and **remove** animals at any time. They can
 **add** animals **only while the window is open** (disabled after `close_at`). Once the
 registration is **checked-in** (or the event completes), self-edit locks.
+
+The edit-link page also **shows the owner's current result** (FR-41): their assigned **AnimalID**
+if selected/waitlisted, a **"not selected"** notice once the lottery has run (or "pending" before),
+and the checked-in/printed state on clinic day — visible **even after editing locks**, so an owner
+can always learn their outcome without an SMS (e.g., if they declined texts or a text didn't
+deliver). The page also lets the owner **change their SMS preference** (FR-42): turn texts on/off,
+which sets `sms_opt_out`.
 
 ### 7.6 Clinic check-in + print (volunteer)
 Volunteer logs in → selects event → enters **AnimalID** (or searches by name/phone) → record
@@ -306,6 +317,9 @@ website and exposes the existing native `printLabel` channel to the page via a J
   after `close_at` if not yet run (FR-40; plan R-4)
 - ✅ Event deletion → admin can delete an entire event behind a confirmation (FR-39; plan R-9)
 - ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10)
+- ✅ Owner status visibility → the edit-link page always shows the lottery result (FR-41)
+- ✅ SMS consent/opt-out → signup checkbox defaults to **on**; owner can uncheck or toggle later
+  via the edit link (FR-42); status still viewable without texts
 
 ---
 
@@ -355,11 +369,13 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-17** After the lottery, send a **result SMS to every registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**.
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** registrants receive a courtesy result SMS (Decision 1).
+- **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording pending (Decision 13).
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to everyone; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
 - **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed); admin can always add.
 - **FR-22** Edit link valid from signup **until the registration is checked-in or the event completes**.
+- **FR-41** The edit-link page displays the owner's current result (assigned AnimalID for selected/waitlisted; "not selected" once the lottery has run; "pending" before; checked-in/printed state on clinic day) — visible even after self-edit locks, so SMS is not the only status channel.
 
 **Clinic check-in (volunteer/admin)**
 - **FR-23** Lookup by **AnimalID** or search by name/phone (fuzzy).

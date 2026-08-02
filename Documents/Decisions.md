@@ -80,11 +80,17 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 
 ---
 
-## Decision 13 — Twilio cost / consent / opt-out wording (plan R-11)
-**Decision:** 🔶 **Pending.** 2 SMS/registrant × up to Z/event; the budget and the SMS opt-out wording need the Admin's confirmation before launch. The Z cap (Decision 12) bounds the blast.
-**Your answer:** 🔶 Awaiting confirmation.
+## Decision 13 — Twilio budget + opt-out/consent wording (plan R-11)
+**Decision:** 🔶 **Pending (wording only).** Per event: a signup text and a result text go to each consenting registrant (≤ Z), so the blast is bounded by Z (Decision 12). The **consent/opt-out capability exists** (FR-42: signup checkbox, default on). What remains is the **budget sign-off** and the exact **opt-out/consent wording** ("Reply STOP to opt out", the signup checkbox label) before launch.
+**Your answer:** 🔶 Awaiting confirmation (cost OK in principle; wording TBD).
+
+---
+
+## Decision 14 — Owner status visibility + SMS consent (FR-41/FR-42)
+**Decision:** The edit-link page **always shows the owner's current result** (AnimalID / "not selected" / "pending" / checked-in) — even after self-edit locks — so an owner can learn their outcome **without an SMS**. SMS consent is a **checkbox on the signup form, checked by default**; unchecking (or toggling later on the edit link) sets `sms_opt_out` and skips all SMS, while status stays viewable on the edit-link page. The result SMS still goes to **every** consenting registrant, including a courtesy text to not-selected (Decision 1 stands).
+**Your answer:** ✅ Confirmed — edit-link shows result (FR-41); SMS consent checkbox default-on + opt-out (FR-42); result text to everyone (Decision 1 kept).
 
 ---
 
 ## Summary
-Decisions 1–12 are confirmed. The only open item is **Decision 13 (Twilio cost/consent/opt-out wording)** — pending the Admin's confirmation before launch. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, and applicant cap Z (Decisions 10–12) are reflected in Requirements/Architecture/Traceability as **FR-38/FR-39/FR-40**.
+Decisions 1–12 and 14 are confirmed. The only open item is **Decision 13 (Twilio budget sign-off + opt-out/consent wording)**. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, applicant cap Z (Decisions 10–12), and owner status-visibility/SMS consent (Decision 14) are reflected in Requirements/Architecture/Traceability as **FR-38..FR-42**.

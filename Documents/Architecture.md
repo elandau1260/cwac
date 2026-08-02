@@ -86,7 +86,7 @@ existing Flutter/Android app reused solely as the label-print station.
 |---|---|---|
 | `accounts` | Username/password login; both roles share privileges | FR-30, FR-32 |
 | `events` | Create/configure events; `open_at`/`close_at` window (auto close, no manual lock); per-event applicant cap Z; unique slug; QR/URL download; delete entire event; back-office via Django admin | FR-1..FR-4, FR-34, FR-38, FR-39 |
-| `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close) | FR-5..FR-11, FR-20..FR-22, FR-33 |
+| `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; SMS-consent checkbox (default on); stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close); edit-link shows lottery result; SMS opt-out toggle | FR-5..FR-11, FR-20..FR-22, FR-33, FR-41, FR-42 |
 | `lottery` | Random shuffle + select whole registrations to X/Y caps; assign sequential AnimalIDs; set statuses; single-run guard (manual click + noon auto-run) | FR-12..FR-15, FR-40 |
 | `sms` | Send signup-confirmation + lottery-result SMS via Twilio in the registration's stored language | FR-16..FR-19 |
 | `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; admin manual entry create + AnimalID assignment | FR-23..FR-28, FR-35..FR-37 |
@@ -117,7 +117,7 @@ Entities (full field lists in `Requirements.md` §5). Relationships:
 ```
 Event 1──* Registration 1──* Animal
   │            │
-  │            └── edit_token, animal_id, status, language, printed_at
+  │            └── edit_token, animal_id, status, language, printed_at, sms_opt_out
   └── services_offered, x_seen, y_waitlist, z_applicants, open_at, close_at (auto close; no manual lock)
 
 User (admin/volunteer)  ── standalone, role label only (same priv)
@@ -165,9 +165,11 @@ ops burden near zero (NFR-2).
 ### 7.1 Registration → signup SMS
 ```
 Owner --> /r/EVENT (during [open_at, close_at)) --> register app renders form (lang toggle)
-Owner submits --> validate (required owner fields, ≤6 animals) --> save Registration+Animals (+language)
+Owner submits --> validate (required owner fields, ≥1..≤6 animals) --> save Registration+Animals
+              (+language; +sms_opt_out from consent checkbox, default False = consent)
               --> confirmation screen (FR-11)
-              --> sms app: send signup-confirmation SMS #1 with edit link, in chosen language (FR-16/18)
+              --> if consented: sms app sends signup-confirmation SMS #1 with edit link, in chosen language (FR-16/18)
+              --> if declined: no SMS; edit link shown on-screen so they can return (FR-42)
 ```
 
 ### 7.2 Window closes → lottery → result SMS
@@ -201,6 +203,8 @@ clinic app: admin creates a registration (owner+animals) and/or assigns the next
 Owner --> /r/EVENT/edit/TOKEN (from SMS #1 or #2)
 register app: validate token + window/check-in state
             --> render entry (add enabled only if window open; remove/edit always)
+            --> always show status banner: AnimalID / "not selected" / "pending" / checked-in (FR-41)
+            --> SMS-preference toggle -> sets sms_opt_out (FR-42)
 Owner edits/adds(while open)/removes --> save
 ```
 
@@ -284,11 +288,12 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 10. ✅ Lottery trigger → **hybrid**: admin-run, or auto-run at noon (event tz) day-after-`close_at` (FR-40; plan R-4).
 11. ✅ Event deletion → admin can delete an entire event behind a confirmation (FR-39; plan R-9).
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
+13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 
 **Still open:**
 - Concurrency at check-in — Postgres chosen to absorb concurrent volunteer writes; verify with a
   load check at one busy event.
-- **R-11 Twilio cost/consent/opt-out wording** — 2 SMS/registrant × up to Z/event; budget and
-  opt-out wording to confirm before launch (plan R-11). The lottery single-run path itself is
-  hardened (lock + reload the Event row inside the transaction; see §7.2), so manual-vs-cron
-  concurrency is covered by design.
+- **R-11 Twilio budget sign-off + opt-out/consent wording** — the consent/opt-out capability
+  exists (FR-42) and the lottery single-run path is hardened (lock + reload the Event row inside
+  the transaction; see §7.2); what remains is the exact consent/opt-out wording and a budget
+  sign-off before launch (plan R-11; Decision 13).

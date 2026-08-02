@@ -105,6 +105,7 @@ migration is made.
 - `language` CharField(2, choices en/es, default en) — **chosen at signup, drives SMS**
 - `printed_at`, `checked_in_at` DateTimeField(null, blank)
 - `result_sms_sent_at` DateTimeField(null, blank) — idempotency guard for lottery-result SMS (R-4)
+- `sms_opt_out` BooleanField(default=False) — owner declined SMS (set by the signup consent checkbox, FR-42); when True, signup + result SMS are skipped and status is shown on the edit-link page (FR-41)
 - `first_name`, `last_name` CharField(100); `phone` CharField(20) E.164; `email` EmailField; `address` CharField(300) — **all required**
 - `created_by` choices self/admin (default self); `created_at`, `updated_at`
 - **Meta.constraints:** `UniqueConstraint(fields=[event, animal_id], condition=Q(animal_id__isnull=False))`
@@ -174,16 +175,25 @@ event-complete → "locked"). Add control visibility + **server-side POST re-val
 `owner_can_add(reg)` (not just hiding the button) — TC-022/023/041/042. Renders in
 `registration.language` via `translation.override`.
 
+**Status banner (FR-41, TC-053):** always render the owner's current result — assigned AnimalID
+(selected/waitlisted), "not selected" (once run), or "pending" (before) — plus checked-in/printed
+state on clinic day. Shown **even when editing is locked**, so the owner can always learn their
+outcome without an SMS.
+
+**SMS-preference toggle (FR-42, TC-054):** a control on this page flips `sms_opt_out`; signup and
+result-SMS steps then respect it.
+
 ### SMS abstraction (`sms/`)
 Pluggable backends (`console`, `locmem` for tests, `twilio`) chosen by `settings.SMS_BACKEND`.
 Templates are `gettext`-marked Python helpers, rendered under `translation.override(reg.language)`:
-- **#1 signup** (sent on submit, FR-16/TC-016): "You're registered for [Event]. Edit here: [link].
-  We'll text you when the lottery runs."
+- **#1 signup** (sent on submit **only if `sms_consent` was checked** — FR-16/42/TC-016): "You're
+  registered for [Event]. Edit here: [link]. We'll text you when the lottery runs." If unchecked,
+  no SMS; the edit link is shown on the confirmation screen.
 - **#2 result** (after lottery, to **every** registrant — FR-17/19, TC-017/018/019): selected →
   "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]"; not_selected →
   courtesy text, **no link**.
 - Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (everyone)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
-- Notify is **idempotent via an atomic DB claim**: `Registration.objects.filter(pk=reg.pk, result_sms_sent_at__isnull=True).update(result_sms_sent_at=now())` — send only if exactly one row was updated, so manual + cron + retry never double-text (Architecture §12; TC-050). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron window.
+- Notify is **idempotent via an atomic DB claim**: `Registration.objects.filter(pk=reg.pk, result_sms_sent_at__isnull=True).update(result_sms_sent_at=now())` — send only if exactly one row was updated, so manual + cron + retry never double-text (Architecture §12; TC-050). **Skips any registrant with `sms_opt_out=True`** (FR-42). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron window.
 
 ### i18n
 Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. EN/ES
@@ -191,7 +201,9 @@ toggle via `?lang=<code>` setting the `django_language` cookie; the chosen value
 `Registration.language` (TC-046) and selects the SMS catalog.
 
 ### Owner form (dynamic formset)
-`OwnerForm` (all owner fields required — TC-007; phone validated/normalized). `AnimalForm(event=…)`
+`OwnerForm` (all owner fields required — TC-007; phone validated/normalized) **+ an
+`sms_consent` BooleanField(initial=True)** — "Send me updates by text"; submitting unchecked sets
+`Registration.sms_opt_out=True` (FR-42; TC-054). `AnimalForm(event=…)`
 conditionally shows `last_vaccinated_date` (if vaccination), `medical_concern` (if vet), and one
 checkbox per offered service (TC-009/010). `formset_factory(AnimalForm, extra=1, min_num=1,
 validate_min=True, max_num=N, validate_max=True)`:
@@ -258,7 +270,8 @@ Other automatable: TC-002 (slug), TC-004 (window), TC-007/008 (validation + cap)
 (SMS via locmem), TC-031 (payload shape), TC-032 (export columns), TC-039 (env creds), TC-041
 (post-close add blocked), TC-043 (printed_at), TC-044/045 (manual entry + AnimalID), TC-046
 (language stored), TC-047 (applicant cap Z), TC-048 (event deletion), TC-049 (noon auto-run),
-TC-050 (no concurrent double-run), TC-051 (≥1 animal), TC-052 (over-cap owner edit). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
+TC-050 (no concurrent double-run), TC-051 (≥1 animal), TC-052 (over-cap owner edit), TC-053
+(edit-link shows result), TC-054 (SMS consent checkbox / opt-out). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
 
 ---
 
