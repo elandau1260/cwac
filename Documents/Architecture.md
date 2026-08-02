@@ -264,15 +264,12 @@ times, X, Y, services, languages) is set per event by the admin (FR-1).
 1. ✅ Print integration → **Option B** (Flutter WebView shell) (§8).
 2. ✅ Edit-link window → from signup until check-in/event close; two-SMS flow.
 3. ✅ SMS → two touchpoints (signup confirmation + lottery results); courtesy text to not-selected.
-4. ✅ AnimalID → **sequential from 1, max 999** (in shuffled order). *(start value 0 vs 1 pending)*
+4. ✅ AnimalID → **sequential from 1, max 999** (in shuffled order; start value confirmed = 1).
 5. ✅ Waitlist promotion → none in V1; `printed_at` tracks attendance.
 6. ✅ Lottery → single run; admin can manually add entries & assign AnimalIDs.
 7. ✅ Admin/volunteer UI → English-only.
 8. ✅ Registration open/close → **timestamp-driven (`open_at`/`close_at`); no manual lock**.
 9. ✅ Pet labels → grouped (~3/label, exact count by print testing).
-
-**Pending:**
-- AnimalID start value: **0 or 1?** (docs currently 1).
 
 **Still open:**
 - Concurrency at check-in — Postgres chosen to absorb concurrent volunteer writes; verify with a

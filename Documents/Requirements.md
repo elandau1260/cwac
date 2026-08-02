@@ -74,8 +74,7 @@ AnimalID, edits as needed, and **prints labels**.
   (edit/remove still allowed). Automatic.
 - **Registration (Entry)** — one owner's submission for an event. Contains owner info + animals.
 - **Animal** — one pet within a registration.
-- **AnimalID** — a sequential integer **starting at 1** (1, 2, 3, …, max **999**; *see open
-  question on 0 vs 1*), assigned in the lottery's **shuffled** order to selected + waitlisted
+- **AnimalID** — a sequential integer **starting at 1** (1, 2, 3, …, max **999**), assigned in the lottery's **shuffled** order to selected + waitlisted
   registrations, or **manually by an admin** (next available number). One per registration
   (identifies the owner + all their animals). The volunteer types it at check-in to pull the
   record. Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next
@@ -293,9 +292,6 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ Registration open/close → **timestamp-driven (`open_at`/`close_at`); no manual lock** (Decision 8)
 - ✅ Pet labels → grouped (~3/label, exact count set by print testing) (Decision 9)
 - ✅ Track the owner's chosen language → stored on registration, drives SMS language
-
-**Pending your nod:**
-- 🔶 AnimalID **start value: 0 or 1?** Docs currently say 1 (you said "1" earlier, "0" most recently).
 
 ---
 
