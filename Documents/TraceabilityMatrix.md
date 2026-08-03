@@ -18,7 +18,7 @@ are in §2.
 | **FR-3** | Download sign-up URL + QR-code JPG | TC-003 |
 | **FR-4** | Lifecycle; signups only during [open_at, close_at) (auto, no manual lock) | TC-004 |
 | **FR-34** | After close_at: owners edit/remove only (no add); admin can always add/edit | TC-041 |
-| **FR-38** | Per-event applicant cap Z rejects new signups when full (existing owners can still add) | TC-047 |
+| **FR-38** | Per-event applicant cap Z (soft) rejects new signups when full; slight concurrent overshoot ok | TC-047 |
 | **FR-39** | Admin can delete an entire event (cascade) behind a confirmation | TC-048 |
 | **FR-5** | Public form via event URL, no login | TC-005 |
 | **FR-6** | EN/ES language toggle | TC-006 |
@@ -32,11 +32,12 @@ are in §2.
 | **FR-14** | AnimalID sequential from 1 (max 999) to selected + waitlisted | TC-014, TC-015 |
 | **FR-15** | Statuses set correctly | TC-014 |
 | **FR-40** | Lottery auto-runs at noon (event tz) day-after-close if not run manually (single-run) | TC-049, TC-050 |
-| **FR-16** | Signup-confirmation SMS immediately on register (with edit link) | TC-016 |
-| **FR-17** | Lottery-result SMS to all; selected/waitlisted include AnimalID | TC-017, TC-018 |
+| **FR-16** | Signup-confirmation SMS to consenters on register (with edit link) | TC-016 |
+| **FR-17** | Best-effort lottery-result SMS to all consenting; selected/waitlisted include AnimalID | TC-017, TC-018, TC-057 |
 | **FR-18** | SMS in the language stored on the registration | TC-018, TC-046 |
-| **FR-19** | Not-selected courtesy SMS | TC-019 |
+| **FR-19** | Not-selected consenting courtesy SMS | TC-019 |
 | **FR-42** | Signup SMS-consent checkbox (default on); toggle via edit link; opted-out = no SMS, status still viewable | TC-054 |
+| **FR-43** | Inbound STOP/START webhook syncs sms_opt_out; outbound skips opted-out + treats Twilio 21610 as durable opt-out; re-consent via START | TC-055, TC-056 |
 | **FR-20** | Token edit link opens entry, no login | TC-020 |
 | **FR-21** | Owner edits; add+remove while open; add disabled after close_at | TC-022, TC-023, TC-042 |
 | **FR-22** | Edit-link valid until check-in / event completion | TC-024 |
@@ -114,7 +115,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-044 | I | Admin creates a registration manually (owner + animals) → saved with `created_by`=admin; lookup-able by name/phone; the 6-animal cap is not enforced. |
 | TC-045 | I | Admin assigns an AnimalID to a registration → accepted if unique within the event (1..999); a duplicate is rejected; the entry is then lookup-able by that AnimalID. |
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
-| TC-047 | I | With Z reached, a new signup is rejected with an EN/ES "registration full" message; an existing owner at the event can still add an animal. |
+| TC-047 | I | With Z reached, a new signup is rejected with an EN/ES "registration full" message; an existing owner at the event can still add an animal. (Z is soft: concurrent signups at the boundary may overshoot by a few — assert the overshoot is small, not zero.) |
 | TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
 | TC-049 | I | `run_due_lotteries` runs an event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched. |
 | TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same event → exactly one run wins (statuses/IDs set once); each registrant gets exactly one result SMS (idempotent). |
@@ -122,12 +123,15 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-052 | I | An owner record a volunteer grew to 8 animals can still be edited/removed by the owner (max tracks current count); an owner at 6 cannot add a 7th. |
 | TC-053 | I | Open the edit link after the lottery: selected/waitlisted → shows their AnimalID; not-selected → shows a "not selected" notice; before the lottery → "pending". Status still shows after the edit locks (check-in / event complete). |
 | TC-054 | I | Signup form shows an SMS-consent checkbox checked by default. Submit with it unchecked → `sms_opt_out=True`, no SMS sent (signup or result); status still visible on the edit-link page. Leave checked (or re-check via the edit link) → SMS sends normally. |
+| TC-055 | I | An owner texts STOP → inbound webhook sets `sms_opt_out=True`; the next result-SMS send to them is skipped. They text START → `sms_opt_out` cleared; sends resume. |
+| TC-056 | I | Outbound to a Twilio-blocked number returns 21610 → app sets `sms_opt_out=True` (durable) and logs; a website toggle-on alone does not resume delivery until START is received. |
+| TC-057 | I | A result-SMS send that fails at the provider (timeout/reject) is left retryable (`failed`/`unknown`) and re-attempted by the retry sweep; a confirmed send (`sent`) is never re-sent (no double-text). |
 
 ---
 
 ## 3. Notes
 
-- **Coverage:** every FR-1..FR-42 and NFR-1..NFR-4 has ≥1 test case (see §1).
+- **Coverage:** every FR-1..FR-43 and NFR-1..NFR-4 has ≥1 test case (see §1).
 - **Two-SMS flow:** signup confirmation (TC-016) and lottery result (TC-017/018/019) are tested
   separately; Twilio is mocked in integration tests.
 - **Window/close semantics:** TC-004 (window boundary) and TC-041/TC-042 (after close: signups
@@ -143,8 +147,11 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
   FR-7/FR-10/FR-21.
 - **Status visibility & SMS consent:** TC-053 (edit-link shows result) and TC-054 (signup consent
   checkbox + opt-out) cover FR-41/FR-42.
+- **SMS delivery & provider opt-out:** TC-055 (STOP), TC-056 (START/21610), and TC-057
+  (provider-failure retry) cover FR-43 and the best-effort delivery model (FR-17).
 - **Labels:** TC-031/TC-040 verify grouped pet labels (~3/label), not one-per-animal.
 - **Test automation targets:** unit (TC-002, TC-009, TC-012, TC-013, TC-015) and integration
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
   TC-043, TC-044, TC-045, TC-046, TC-047, TC-048, TC-049, TC-050, TC-051, TC-052, TC-053,
-  TC-054) should be automated. E2E (browser) and manual/deploy tests are run before each release.
+  TC-054, TC-055, TC-056, TC-057) should be automated. E2E (browser) and manual/deploy tests are
+  run before each release.

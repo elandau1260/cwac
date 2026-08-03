@@ -88,7 +88,7 @@ existing Flutter/Android app reused solely as the label-print station.
 | `events` | Create/configure events; `open_at`/`close_at` window (auto close, no manual lock); per-event applicant cap Z; unique slug; QR/URL download; delete entire event; back-office via Django admin | FR-1..FR-4, FR-34, FR-38, FR-39 |
 | `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; SMS-consent checkbox (default on); stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close); edit-link shows lottery result; SMS opt-out toggle | FR-5..FR-11, FR-20..FR-22, FR-33, FR-41, FR-42 |
 | `lottery` | Random shuffle + select whole registrations to X/Y caps; assign sequential AnimalIDs; set statuses; single-run guard (manual click + noon auto-run) | FR-12..FR-15, FR-40 |
-| `sms` | Send signup-confirmation + lottery-result SMS via Twilio in the registration's stored language | FR-16..FR-19 |
+| `sms` | Send signup-confirmation + best-effort lottery-result SMS via Twilio in the registration's stored language; delivery-state tracking + retry; inbound STOP/START opt-out webhook | FR-16..FR-19, FR-42, FR-43 |
 | `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; admin manual entry create + AnimalID assignment | FR-23..FR-28, FR-35..FR-37 |
 | `printing` | Serve label payload (owner + grouped pet labels) to the print station | FR-28, NFR-4 |
 | `export` | CSV/XLSX export with the agreed columns | FR-29 |
@@ -117,7 +117,7 @@ Entities (full field lists in `Requirements.md` §5). Relationships:
 ```
 Event 1──* Registration 1──* Animal
   │            │
-  │            └── edit_token, animal_id, status, language, printed_at, sms_opt_out
+  │            └── edit_token, animal_id, status, language, printed_at, sms_opt_out, result_sms_state
   └── services_offered, x_seen, y_waitlist, z_applicants, open_at, close_at (auto close; no manual lock)
 
 User (admin/volunteer)  ── standalone, role label only (same priv)
@@ -190,8 +190,9 @@ lottery app: inside transaction.atomic(): lock + reload the Event row (select_fo
             assign sequential AnimalIDs (1..) in shuffled order; set statuses
             set `event.lottery_run_at = now` (the durable single-run guard)
             enqueue result SMS per registrant (all outcomes, in stored language)
-sms app:   idempotent per-reg claim (`result_sms_sent_at`); render EN/ES template per outcome
-           --> Twilio --> owner phone  (FR-17/18/19)
+sms app:   delivery-state tracked (`result_sms_state`: sending→sent on success, failed/unknown
+           retried, never re-sent); render EN/ES template per outcome --> Twilio --> owner phone
+           (FR-17/18/19); skips sms_opt_out; inbound STOP/START webhook syncs opt-out (FR-42/43)
 
 Post-lottery (admin, ad-hoc):
 clinic app: admin creates a registration (owner+animals) and/or assigns the next AnimalID
@@ -290,7 +291,10 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
+15. ✅ SMS delivery + provider opt-out → best-effort delivery with retry (delivery state); inbound STOP/START webhook syncs `sms_opt_out` (FR-43).
 
-**Still open:**
-- Concurrency at check-in — Postgres chosen to absorb concurrent volunteer writes; verify with a
-  load check at one busy event.
+**Residual verification risks (not open decisions):**
+- Check-in concurrency — resolved by design (Postgres + the unique AnimalID index); verify under
+  load at the first busy event.
+- SMS delivery — best-effort by nature (phones off, carrier blocks); the delivery-state + retry
+  maximizes success but cannot guarantee it.

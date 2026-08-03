@@ -15,7 +15,7 @@ that **check-in is fast and labels can be printed** instead of hand-written onto
 
 The end-to-end journey: owner pre-registers online during the open window (gets an immediate
 confirmation + edit link) → the window **closes** at `close_at` → the admin runs a lottery that
-randomly selects which people/animals are seen → all owners are notified by SMS with the result
+randomly selects which people/animals are seen → all consenting owners are notified by SMS with the result
 (selected/waitlisted receive a sequential **AnimalID**) → at the clinic a volunteer enters the
 AnimalID, edits as needed, and **prints labels**.
 
@@ -25,10 +25,10 @@ AnimalID, edits as needed, and **prints labels**.
 
 ### In scope (V1)
 - Public pre-registration form (mobile-first, EN/ES toggle), open during a configured window
-- **Immediate signup-confirmation SMS** with an edit link; owners can edit **and add** animals while the window is open
+- **Immediate signup-confirmation SMS** (to owners who consent) with an edit link; owners can edit **and add** animals while the window is open
 - Registration **closes automatically at `close_at`** — after that, owners can edit/remove but not add
 - Admin "Create Event" with per-event configuration + unique sign-up URL + downloadable QR code
-- Random lottery (selects whole registrations to fill X seen / Y waitlisted); **single run**; **lottery-result SMS** to all registrants
+- Random lottery (selects whole registrations to fill X seen / Y waitlisted); **single run**; **lottery-result SMS** to all consenting registrants
 - Owner self-edit via the SMS link (edit/remove always; **add only while open**)
 - Clinic-side: volunteer looks up by AnimalID (or name/phone), **edits** (including **adding**
   animals), prints labels; printing tags the entry **`printed`** (attendance)
@@ -192,7 +192,7 @@ hour. Both paths call the same single-run routine and cannot double-run. The alg
 5. Assign **AnimalIDs sequentially from 1** (in the shuffled order) to each selected + waitlisted
    registration.
 
-Then **SMS #2** goes to **every** registrant **in the language they chose at signup**:
+Then **SMS #2** goes to **every consenting** registrant **in the language they chose at signup**:
 - **Selected:** *"You're in for [Event]! Your AnimalID is 7. Bring this. [edit link]"*
 - **Waitlisted:** *"You're on the waitlist for [Event]. AnimalID 7. [edit link]"*
 - **Not selected:** *"You were not selected for [Event]. Thank you for registering — please try
@@ -346,7 +346,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-3** Admin can download the sign-up URL and a QR-code JPG.
 - **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at`/`lottery_run_at` and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` and before the lottery runs (timestamp-driven, no manual lock).
 - **FR-34** After `close_at`, owners can edit/remove but **not add** animals; the admin can always add/edit regardless of state.
-- **FR-38** Per-event **applicant cap Z** (admin-configured max registrations/owners). Once reached, **new** signups are rejected with a friendly EN/ES "registration full" message; existing owners may still add animals.
+- **FR-38** Per-event **applicant cap Z** (admin-configured target max registrations/owners). Once reached, **new** signups are rejected with a friendly EN/ES "registration full" message; existing owners may still add animals. **Z is a soft cap** — concurrent signups at the boundary may push the count a few over Z, which is acceptable (no hard limit).
 - **FR-39** Admin can **delete an entire event** (cascade to all its registrations/animals) from the event selector / Django admin, behind a confirmation warning.
 
 **Owner registration (public, no login)**
@@ -366,14 +366,15 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-40** If the lottery has not been run manually, it **runs automatically at noon (in the event's timezone) on the calendar day after `close_at`** (single-run; cannot double-run with a manual run).
 
 **SMS (Twilio)**
-- **FR-16** Send a **signup-confirmation SMS immediately on registration**, containing an edit link.
-- **FR-17** After the lottery, send a **result SMS to every registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**.
+- **FR-16** Send a **signup-confirmation SMS immediately on registration** to owners who consented (FR-42), containing an edit link.
+- **FR-17** After the lottery, send a **best-effort result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. (Delivery is best-effort with retry, not guaranteed.)
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
-- **FR-19** **Not-selected** registrants receive a courtesy result SMS (Decision 1).
+- **FR-19** **Not-selected** consenting registrants receive a courtesy result SMS (Decision 1).
 - **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
+- **FR-43** **STOP/START opt-out sync.** Twilio STOP/START keywords (received via an inbound-SMS webhook) update `sms_opt_out` (STOP → opted out; START → re-consented). Outbound skips opted-out numbers and treats a Twilio block (error 21610) as a durable opt-out; the website toggle cannot override a provider block — re-consent requires START.
 
 **Owner edit (token)**
-- **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to everyone; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
+- **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to every consenting registrant, and shown on the confirmation page to those who declined SMS; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
 - **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed); admin can always add.
 - **FR-22** Edit link valid from signup **until the registration is checked-in or the event completes**.
 - **FR-41** The edit-link page displays the owner's current result (assigned AnimalID for selected/waitlisted; "not selected" once the lottery has run; "pending" before; checked-in/printed state on clinic day) — visible even after self-edit locks, so SMS is not the only status channel.

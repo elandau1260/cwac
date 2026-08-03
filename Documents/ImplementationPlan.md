@@ -17,7 +17,7 @@ clinic a volunteer enters the AnimalID, edits as needed, and **prints labels**.
 
 This is a **greenfield Django app** in `/home/dev/cwac` (today: only `Documents/`
 and `communications/`, no code, no git). Full spec lives in `Documents/` (Requirements,
-Architecture, Decisions, TraceabilityMatrix). **37 FRs + 4 NFRs.**
+Architecture, Decisions, TraceabilityMatrix). **42 FRs (FR-1..FR-42) + 4 NFRs.**
 
 ### Locked scoping (confirmed with user)
 - **Backend-first.** This plan delivers the complete Django backend + a print-payload endpoint with
@@ -88,14 +88,14 @@ migration is made.
 
 ### `events.Event`
 - `slug` SlugField(unique, max 40) → `/r/<slug>/`; `name` CharField(200); `description` TextField(blank); `date` DateField; `location` CharField(200, blank)
-- `open_at`, `close_at` DateTimeField(db_index); `x_seen`, `y_waitlist`, `z_applicants` PositiveIntegerField — **X** animals seen / **Y** waitlist animals / **Z** = max applicants (registrations) per event. All three are admin-configured per event (no hardcoded values); R-10.
+- `open_at`, `close_at` DateTimeField(db_index); `x_seen`, `y_waitlist`, `z_applicants` PositiveIntegerField — **X** animals seen / **Y** waitlist animals / **Z** = soft applicant cap (target max registrations) per event: the point at which new signups stop; a small overshoot under concurrent signups is acceptable (R-10). All three are admin-configured per event (no hardcoded values).
 - `timezone` CharField via `django-timezone-field` (IANA select, default `America/Los_Angeles`) — **per-event, admin-selectable**; sets when "noon" (the auto-lottery deadline) is **and the timezone in which `open_at`/`close_at` are entered and displayed**. `USE_TZ=True`; datetimes stored UTC; a custom admin form converts `open_at`/`close_at` to/from the event's `timezone` so the admin always sees/enters local times for that clinic.
 - `offers_flea_deworming`, `offers_microchip`, `offers_vaccination`, `offers_vet` BooleanField(default=False)
 - `languages` JSONField(default=list) — subset of `["en","es"]`
 - `status` CharField(choices=draft/live/lottery_run/active/completed, default=draft) — the open↔closed distinction is a **computed display label** (from `open_at`/`close_at`/`lottery_run_at`), never stored (R-3)
 - `lottery_run_at` DateTimeField(null, blank) — **durable** signal that permanently blocks signups
 - `created_at`, `updated_at`
-- **Methods (authoritative):** `@property services_offered`; `is_published()`; `signup_open(now=None)` = `is_published() and open_at ≤ now < close_at and lottery_run_at is None`; `at_capacity()` = `registrations.count() >= z_applicants`; `auto_run_deadline()` = noon (12:00 local) on the calendar day after `close_at`, computed in `self.timezone` (returns a tz-aware datetime for comparison against `timezone.now()`); `owner_can_add(reg)` = `signup_open() and reg.status != 'checked_in'`; `owner_can_edit(reg)` = `status != 'completed' and reg.status != 'checked_in'`. The **new-signup** view additionally requires `not at_capacity()` — Z gates only brand-new registrations, not an existing owner adding animals. Displayed open/closed is computed live — no cached drift.
+- **Methods (authoritative):** `@property services_offered`; `is_published()`; `signup_open(now=None)` = `is_published() and open_at ≤ now < close_at and lottery_run_at is None`; `at_capacity()` = `registrations.count() >= z_applicants` (**soft cap** — not locked; concurrent signups at the boundary may overshoot by a few, which is acceptable; R-10); `auto_run_deadline()` = noon (12:00 local) on the calendar day after `close_at`, computed in `self.timezone` (returns a tz-aware datetime for comparison against `timezone.now()`); `owner_can_add(reg)` = `signup_open() and reg.status != 'checked_in'`; `owner_can_edit(reg)` = `status != 'completed' and reg.status != 'checked_in'`. The **new-signup** view additionally requires `not at_capacity()` — Z gates only brand-new registrations, not an existing owner adding animals. The check + insert are deliberately **not serialized** (no Event-row lock): Z is a soft target and a few over is fine (R-10; TC-047). Displayed open/closed is computed live — no cached drift.
 
 ### `register.Registration`
 - `event` FK(Event, related_name=registrations, CASCADE)
@@ -104,7 +104,7 @@ migration is made.
 - `edit_token` CharField(unique, db_index, default=`token_urlsafe(32)`) — 256-bit, only auth for self-edit
 - `language` CharField(2, choices en/es, default en) — **chosen at signup, drives SMS**
 - `printed_at`, `checked_in_at` DateTimeField(null, blank)
-- `result_sms_sent_at` DateTimeField(null, blank) — idempotency guard for lottery-result SMS (R-4)
+- `result_sms_state` CharField(null/sending/sent/failed/unknown, default null) + `result_sms_sent_at` DateTimeField(null, blank, set only on confirmed `sent`) — delivery tracking for the lottery-result SMS: atomically claim null→`sending`, send, then mark `sent` on confirmed success (else `failed`/`unknown`); retried, never double-sent (R-4; TC-057)
 - `sms_opt_out` BooleanField(default=False) — owner declined SMS (set by the signup consent checkbox, FR-42); when True, signup + result SMS are skipped and status is shown on the edit-link page (FR-41)
 - `first_name`, `last_name` CharField(100); `phone` CharField(20) E.164; `email` EmailField; `address` CharField(300) — **all required**
 - `created_by` choices self/admin (default self); `created_at`, `updated_at`
@@ -189,11 +189,24 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
 - **#1 signup** (sent on submit **only if `sms_consent` was checked** — FR-16/42/TC-016): "You're
   registered for [Event]. Edit here: [link]. We'll text you when the lottery runs." If unchecked,
   no SMS; the edit link is shown on the confirmation screen.
-- **#2 result** (after lottery, to **every** registrant — FR-17/19, TC-017/018/019): selected →
-  "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]"; not_selected →
-  courtesy text, **no link**.
+- **#2 result** (after lottery, to **every consenting** registrant — FR-17/19, TC-017/018/019):
+  selected → "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]";
+  not_selected → courtesy text, **no link**.
 - Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (everyone)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
-- Notify is **idempotent via an atomic DB claim**: `Registration.objects.filter(pk=reg.pk, result_sms_sent_at__isnull=True).update(result_sms_sent_at=now())` — send only if exactly one row was updated, so manual + cron + retry never double-text (Architecture §12; TC-050). **Skips any registrant with `sms_opt_out=True`** (FR-42). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron window.
+- Delivery is **best-effort with retry**, tracked by `result_sms_state`: atomically claim
+  `null→sending` (`Registration.objects.filter(pk=reg.pk, result_sms_state__isnull=True).update(result_sms_state='sending')`
+  — only the claimant sends), call Twilio, then set `sent` + `result_sms_sent_at` on confirmed
+  success, `failed` on a known error, or `unknown` on timeout. A retry sweep re-attempts
+  `failed`/`unknown` (and stale `sending`); a `sent` row is never re-sent, so manual + cron + retry
+  never double-text (Architecture §12; TC-050/057). Delivery is **not guaranteed** (phones off,
+  carrier blocks) — FR-17/19 are best-effort. **Skips any registrant with `sms_opt_out=True`**
+  (FR-42). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends
+  are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron
+  window.
+- **STOP/START opt-out sync (FR-43):** an inbound-SMS webhook (`/sms/inbound/`, Twilio Advanced
+  Opt-Out) mirrors STOP→`sms_opt_out=True` and START→`sms_opt_out=False`. Outbound treats a Twilio
+  `21610` (blocked) as a durable opt-out (set + log). The website toggle (FR-42) and the provider
+  blocklist reconcile on each send — a provider block wins; re-consent requires START (TC-055/056).
 
 ### i18n
 Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. EN/ES
@@ -241,17 +254,17 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | Phase | Build | Key files | FRs / TCs |
 |---|---|---|---|
 | **0 Scaffolding** | `git init`; `.gitignore`; `startproject config .` + settings split; 8 app packages; requirements; `runtime.txt`; `render.yaml`; `.env.example`; `templates/` `static/` `locale/` | `manage.py`, `config/settings/base.py`, `config/urls.py`, `requirements/base.txt`, `render.yaml` | NFR-2 plumbing |
-| **1 Models + admin** | All 4 models, `makemigrations`, partial unique index, read-time window helpers + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `*/admin.py` | FR-1/2/8/14/37; TC-002, TC-009 |
-| **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade) behind a confirmation warning (R-9) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32; TC-001/003/033/035 |
-| **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z applicant cap → friendly full message)**; `OwnerForm` + dynamic `AnimalFormSet(max_num=6)`; confirmation screen (no guaranteed time); persist language; fire SMS #1 | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33; TC-004/005/006/007/008/010/011/016/037/046 |
-| **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); edit/remove always; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34; TC-020/021/022/023/024/041/042 |
-| **5 Lottery** | `run_lottery` service + exceptions; admin "Run lottery" action; `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15; TC-012/013/014/015 |
-| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every registrant in stored language; wired after lottery run | `sms/templates.py`, `lottery/services.py` | FR-17/18/19; TC-017/018/019 |
+| **1 Models + admin** | All 4 models, `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS fields (`sms_opt_out`, `result_sms_state`/`result_sms_sent_at`); full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `*/admin.py` | FR-1/2/8/14/37/38; TC-002, TC-009, TC-047 |
+| **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade) behind a confirmation warning (R-9) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32/39; TC-001/003/033/035/048 |
+| **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z soft applicant cap → friendly full message; slight overshoot ok)**; `OwnerForm` (+ `sms_consent` checkbox, default on) + dynamic `AnimalFormSet(min_num=1, max_num=6)`; confirmation screen (no guaranteed time; shows the edit link even if SMS was declined); persist language; fire SMS #1 to consenters | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33/38/42; TC-004/005/006/007/008/010/011/016/037/046/047/051/054 |
+| **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); edit/remove always; **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
+| **5 Lottery** | `run_lottery` service (Event-row lock + post-lock guard) + exceptions; admin "Run lottery" action; `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4/FR-40) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15/40; TC-012/013/014/015/049/050 |
+| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting** registrant in stored language (`result_sms_state` delivery tracking, skips `sms_opt_out`); **inbound STOP/START webhook handler** (FR-43); wired after lottery run | `sms/templates.py`, `sms/views.py` (webhook), `lottery/services.py` | FR-17/18/19/43; TC-017/018/019/055/056/057 |
 | **7 Clinic check-in + lookup** | `LoginRequiredMixin` views: `select_event` (session), `lookup` (AnimalID exact / fuzzy name+phone, **event-scoped**), `detail` (editable, `max_num=None`), add/remove/save, `check_in`; ordered waitlist list (no promotion) | `clinic/{views,urls}.py`, `templates/clinic/*` | FR-23/24/25/26/27; TC-025/026/027/028/029/030/034/036 |
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
 | **9 Export** | CSV streaming + XLSX builders | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
 | **10 Admin manual entry + AnimalID** | Admin create Registration (`created_by=admin`, no cap); "next available" AnimalID button; `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4 auto-lottery) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32; TC-038/039 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); configure **Twilio inbound webhook** for STOP/START (FR-43) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32; TC-038/039 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -271,7 +284,8 @@ Other automatable: TC-002 (slug), TC-004 (window), TC-007/008 (validation + cap)
 (post-close add blocked), TC-043 (printed_at), TC-044/045 (manual entry + AnimalID), TC-046
 (language stored), TC-047 (applicant cap Z), TC-048 (event deletion), TC-049 (noon auto-run),
 TC-050 (no concurrent double-run), TC-051 (≥1 animal), TC-052 (over-cap owner edit), TC-053
-(edit-link shows result), TC-054 (SMS consent checkbox / opt-out). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
+(edit-link shows result), TC-054 (SMS consent checkbox / opt-out), TC-055 (STOP→opt-out),
+TC-056 (START re-consent + 21610), TC-057 (provider-failure retry). E2E/manual: TC-005/006/010/011/020–030/033/034/036/037/038/040.
 
 ---
 
@@ -318,9 +332,9 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   **locks the Event row inside the transaction and re-checks `lottery_run_at` after the lock**, so a
   concurrent manual click and cron run cannot double-run (TC-050). Auto path = `run_due_lotteries`
   command on a Render Cron Job (hourly) + an admin "overdue lottery" warning/one-click-run banner as
-  a no-cron fallback. Result SMS is idempotent via an atomic per-reg claim (`result_sms_sent_at`) +
-  concurrent so ~Z texts finish quickly and never double-send.
-- **R-5 Check-in concurrency — RESOLVED.** One volunteer/printer is the norm; two+ volunteers with
+  a no-cron fallback. Result SMS is tracked by a delivery state (`result_sms_state`) — best-effort with retry, never
+  double-sent — and sent concurrently so ~Z texts finish quickly.
+- **R-5 Check-in concurrency — RESOLVED by design (verify at first busy event).** One volunteer/printer is the norm; two+ volunteers with
   two printers also work cleanly — that's exactly why Postgres (not SQLite). Duplicate AnimalIDs are
   blocked by the unique index; two volunteers editing the same registration is last-write-wins and
   idempotent for check-in/printed_at.
@@ -339,11 +353,15 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   purges old clinics on demand). Served from the event selector / Django admin delete-confirmation.
 - **R-10 Applicant cap "Z" — ADDED feature.** Per-event `z_applicants` field alongside X and Y = max
   registrations/owners allowed; **admin-configured per event (no hardcoded value)**. Once reached,
-  new signups are rejected with a friendly EN/ES "registration is full" message. Gates only
-  brand-new registrations (existing owners may still add animals).
+  new signups are rejected with a friendly EN/ES "registration is full" message. **Z is a soft cap:
+  the capacity check + insert are not serialized, so concurrent signups at the boundary may push the
+  count a few over Z — acceptable (no lock needed).** Gates only brand-new registrations (existing
+  owners may still add animals).
 - **R-11 Twilio cost/consent — RESOLVED.** 2 SMS/registrant × up to Z/event; budget approved by
-  the Admin. Consent = signup checkbox (default on) + "Reply STOP to opt out" on every SMS
-  (FR-42). The Z cap (R-10) bounds the blast; exact compliance copy polished at build time.
+  the Admin. Consent = signup checkbox (default on) + "Reply STOP to opt out" on every SMS,
+  honored provider-side via the inbound STOP/START webhook (FR-42/FR-43). The Z cap (R-10) bounds
+  the blast; exact compliance copy polished at build time. Delivery is best-effort with retry
+  (R-4 delivery state), not guaranteed.
 
 ---
 
