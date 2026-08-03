@@ -341,8 +341,9 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   registrations/owners allowed; **admin-configured per event (no hardcoded value)**. Once reached,
   new signups are rejected with a friendly EN/ES "registration is full" message. Gates only
   brand-new registrations (existing owners may still add animals).
-- **R-11 Twilio cost/consent — to confirm with the Admin.** 2 SMS/registrant × up to Z/event; budget +
-  opt-out wording. The Z cap (R-10) bounds the blast.
+- **R-11 Twilio cost/consent — RESOLVED.** 2 SMS/registrant × up to Z/event; budget approved by
+  the Admin. Consent = signup checkbox (default on) + "Reply STOP to opt out" on every SMS
+  (FR-42). The Z cap (R-10) bounds the blast; exact compliance copy polished at build time.
 
 ---
 

@@ -289,11 +289,8 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 11. ✅ Event deletion → admin can delete an entire event behind a confirmation (FR-39; plan R-9).
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
+14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
 
 **Still open:**
 - Concurrency at check-in — Postgres chosen to absorb concurrent volunteer writes; verify with a
   load check at one busy event.
-- **R-11 Twilio budget sign-off + opt-out/consent wording** — the consent/opt-out capability
-  exists (FR-42) and the lottery single-run path is hardened (lock + reload the Event row inside
-  the transaction; see §7.2); what remains is the exact consent/opt-out wording and a budget
-  sign-off before launch (plan R-11; Decision 13).

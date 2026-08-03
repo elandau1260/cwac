@@ -320,6 +320,7 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ Owner status visibility → the edit-link page always shows the lottery result (FR-41)
 - ✅ SMS consent/opt-out → signup checkbox defaults to **on**; owner can uncheck or toggle later
   via the edit link (FR-42); status still viewable without texts
+- ✅ Twilio budget + opt-out/consent wording → approved (Decision 13)
 
 ---
 
@@ -369,7 +370,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-17** After the lottery, send a **result SMS to every registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**.
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** registrants receive a courtesy result SMS (Decision 1).
-- **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording pending (Decision 13).
+- **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to everyone; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
