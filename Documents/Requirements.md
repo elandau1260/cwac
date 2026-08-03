@@ -106,7 +106,6 @@ AnimalID, edits as needed, and **prints labels**.
 | `z_applicants` | Max registrations (owners) per event (FR-38); admin-configured. Gates only brand-new signups (existing owners may still add animals). |
 | `services_offered` | Subset of: `flea_deworming`, `microchip`, `vaccination`, `vet` |
 | `status` | Stored stages `draft` → `live` → `lottery_run` → `active` → `completed`; the **open↔closed** label is computed from `open_at`/`close_at` (+ the `live` stage), never stored (R-3) |
-| `languages` | `EN`, `ES` (which the public form offers) |
 
 ### Registration (one per owner per event)
 | Field | Notes |
@@ -153,7 +152,7 @@ When creating an event, the admin sets:
 - **X** (animals seen), **Y** (waitlist animals), and **Z** (max registrations/owners — FR-38)
 - Services offered (checkboxes for flea/deworming, microchip, vaccination, vet — excludes
   grooming and spay/neuter, which are handled elsewhere)
-- Languages offered (EN/ES)
+- Languages: **always EN + ES** (not per-event; the public form always offers both — FR-6/FR-33)
 
 The admin can then **download the sign-up URL and a QR-code image (JPG)** for flyers. Staff who
 refer people (shelter front desk, animal control, HAPI, Project Pet) point owners at that URL/QR.
@@ -355,7 +354,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 ### Functional Requirements
 
 **Event management (admin)**
-- **FR-1** **Admin** can create an event with full configuration (name, description, date, location, open/close times, X, Y, services offered, languages). (**Admin-only** — Decision 16.)
+- **FR-1** **Admin** can create an event with full configuration (name, description, date, location, open/close times, X, Y, Z, services offered). (**Admin-only** — Decision 16.)
 - **FR-2** Each event has a unique sign-up URL/slug.
 - **FR-3** Admin can download the sign-up URL and a QR-code JPG.
 - **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at` (+ the `live` stage) and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` while the event is `live` (timestamp-driven, no manual lock).

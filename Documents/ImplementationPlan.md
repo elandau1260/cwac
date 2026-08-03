@@ -92,7 +92,6 @@ migration is made.
 - `open_at`, `close_at` DateTimeField(db_index); `x_seen`, `y_waitlist`, `z_applicants` PositiveIntegerField — **X** animals seen / **Y** waitlist animals / **Z** = soft applicant cap (target max registrations) per event: the point at which new signups stop; a small overshoot under concurrent signups is acceptable (R-10). All three are admin-configured per event (no hardcoded values).
 - `timezone` CharField via `django-timezone-field` (IANA select, default `America/Los_Angeles`) — **per-event, admin-selectable**; sets when "noon" (the auto-lottery deadline) is **and the timezone in which `open_at`/`close_at` are entered and displayed**. `USE_TZ=True`; datetimes stored UTC; a custom admin form converts `open_at`/`close_at` to/from the event's `timezone` so the admin always sees/enters local times for that clinic.
 - `offers_flea_deworming`, `offers_microchip`, `offers_vaccination`, `offers_vet` BooleanField(default=False)
-- `languages` JSONField(default=list) — subset of `["en","es"]`
 - `status` CharField(choices=draft/live/lottery_run/active/completed, default=draft) — the open↔closed distinction is a **computed display label** (open iff `status == 'live'` and `open_at ≤ now < close_at`), never stored (R-3)
 - `lottery_run_at` DateTimeField(null, blank) — durable **single-run guard** (the lottery sets it once; also the marker the auto-run check uses). It is **not** a signup gate — signups are time-window + `live`-status driven (FR-4)
 - `created_at`, `updated_at`
@@ -257,9 +256,11 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
   controls only application consent and is independent of Twilio's blocklist. (FR-42/43; TC-055/056.)
 
 ### i18n
-Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. EN/ES
-toggle via `?lang=<code>` setting the `django_language` cookie; the chosen value is persisted to
-`Registration.language` (TC-046) and selects the SMS catalog.
+Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. The
+form **always offers both EN and ES** — there is no per-event language config (FR-6/FR-33), so every
+event's public form exposes the same EN/ES toggle. The `?lang=en|es` toggle sets the
+`django_language` cookie (any other value is ignored, falling back to the current language), and the
+chosen value is persisted to `Registration.language` (TC-006/046) and selects the SMS catalog.
 
 ### Owner form (dynamic formset)
 `OwnerForm` (all owner fields required — TC-007; phone validated/normalized) **+ an
@@ -312,7 +313,7 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
 | **9 Export (Admin-only)** | CSV streaming + XLSX builders (role-gated: admin only — FR-29/Decision 16) | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
 | **10 Manual entry + AnimalID (both roles)** | Create Registration (`created_by=staff`, no 6-animal cap — FR-36) from the **clinic UI (both admin & volunteer)** plus the Django-admin back-office; "next available" AnimalID button (FR-37); **assigning an ID to a `registered`/`not_selected` row atomically sets `status='selected'`** (admit → status banner shows the ID, clinic-lookup-able, exported); `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `clinic/views.py`, `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command (creates the initial **Admin** with `is_staff=True`; **volunteers** are provisioned later with `is_staff=False` — Decision 16); **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; no webhooks — FR-43); **deploy smoke** — send one live result-SMS end-to-end and confirm it arrives before declaring SMS deployable (TC-057) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command (creates the initial **Admin** with `is_staff=True`; **volunteers** are provisioned later with `is_staff=False` — Decision 16); **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; off by default, no webhooks — FR-43); **deploy smoke (TC-057, FR-43/NFR-3)** — on a real US handset: send a live result-SMS (accepted 2xx + arrives), then **verify Advanced Opt-Out is actually enabled** by exercising STOP → next send blocked → HELP reply → START → delivery restored. SMS is not deployable until TC-057 passes. | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -321,9 +322,9 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 
 `pytest-django` + `factory_boy` for unit/integration; Playwright for E2E; manual + deploy before
 each release. All SMS-sending tests use the `locmem` backend; TC-039 additionally grep-asserts no
-creds in source. **Concurrency/locking tests (TC-050 single-run, TC-047 soft-cap) require
-PostgreSQL** — `select_for_update()` is a no-op on SQLite — so run them under a Postgres
-`TransactionTestCase`/pytest-django job, not the default SQLite dev DB.
+creds in source. **Locking tests (TC-049 before-close lottery guard, TC-050 single-run, TC-047
+soft-cap) require PostgreSQL** — `select_for_update()` is a no-op on SQLite — so run them under a
+Postgres `TransactionTestCase`/pytest-django job, not the default SQLite dev DB.
 
 **Highest-value automation — the lottery core (Phase 5):** TC-012 (cap math), TC-013 (randomness
 distribution over ~2000 seeded runs), TC-014 (statuses + unique IDs), TC-015 (sequential from 1,
@@ -452,6 +453,9 @@ no writable disk at runtime → collectstatic at build.
    yes/no, language).
 6. **Automated:** `pytest` — green across the unit/integration TCs above (esp. TC-012/013/014/015).
 7. **Deploy:** push to GitHub → Render build/deploy → site reachable over HTTPS; confirm Twilio creds
-   are absent from the repo (`git grep`).
+   are absent from the repo (`git grep`). **Run the SMS deploy smoke (TC-057):** a live result-SMS is
+   accepted (2xx) and arrives on a real US handset, then STOP → next send blocked, HELP reply, START →
+   delivery restored — to confirm Advanced Opt-Out is enabled. Do not declare SMS deployable until
+   TC-057 passes.
 8. **Phase 12 (later):** print real owner + grouped pet labels on the 3nStar PPT305BT (TC-040) and
    lock `ANIMALS_PER_LABEL`.

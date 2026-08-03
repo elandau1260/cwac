@@ -276,7 +276,7 @@ second UI.)
 ## 11. Configuration & Secrets
 
 All environment-driven (see §6). No credentials in code or in git. Event-level config (open/close
-times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38).
+times, X, Y, Z, services) is set per event by the admin (FR-1, FR-38). The public form always offers both EN and ES (not per-event config — FR-6/FR-33).
 
 ---
 

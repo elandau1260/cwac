@@ -37,9 +37,9 @@ are in §2.
 | **FR-18** | SMS in the language stored on the registration | TC-018, TC-046 |
 | **FR-19** | Not-selected consenting courtesy SMS | TC-019 |
 | **FR-42** | Signup SMS-consent checkbox (default on) = application consent; toggle via edit link; opted-out = no SMS, status still viewable | TC-054 |
-| **FR-43** | Provider-side opt-out (not mirrored): STOP/START/HELP handled by Twilio Advanced Opt-Out on the Messaging Service (no inbound webhook, no `PhoneBlock`); a send to a blocked number is accepted (`sent`) — the async `21610` is unobserved; app-side gate is `sms_opt_out` only; re-consent via START | TC-055, TC-056 |
+| **FR-43** | Provider-side opt-out (not mirrored): STOP/START/HELP handled by Twilio Advanced Opt-Out on the Messaging Service (no inbound webhook, no `PhoneBlock`); a send to a blocked number is accepted (`sent`) — the async `21610` is unobserved; app-side gate is `sms_opt_out` only; re-consent via START | TC-055, TC-056, TC-057 |
 | **FR-20** | Token edit link opens entry, no login | TC-020 |
-| **FR-21** | Owner edits; add+remove while open; add disabled after close_at | TC-022, TC-023, TC-042 |
+| **FR-21** | Owner edits; add+remove while open; add disabled after close_at | TC-021, TC-022, TC-023, TC-042 |
 | **FR-22** | Edit-link valid until check-in / event completion | TC-024 |
 | **FR-41** | Edit-link page shows current result (AnimalID / not-selected / pending) even after edit locks | TC-053 |
 | **FR-23** | Lookup by AnimalID or name/phone | TC-025, TC-026 |
@@ -58,7 +58,7 @@ are in §2.
 | **FR-33** | EN/ES public form + SMS; chosen language stored (admin UI English-only) | TC-006, TC-018, TC-046 |
 | **NFR-1** | Mobile-first/thumb-friendly UI | TC-037 |
 | **NFR-2** | PaaS + managed Postgres + HTTPS | TC-038 |
-| **NFR-3** | SMS via Twilio; creds from env | TC-039 |
+| **NFR-3** | SMS via Twilio; creds from env | TC-039, TC-057 |
 | **NFR-4** | Printing via Flutter/3nStar bridge | TC-040 |
 
 ---
@@ -125,7 +125,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-054 | I | Signup form shows an SMS-consent checkbox checked by default. Submit with it unchecked → `sms_opt_out=True`, no SMS sent (signup or result); status still visible on the edit-link page. Leave checked (or re-check via the edit link) → SMS sends normally. |
 | TC-055 | I | **Fire-and-forget result SMS:** a consenting registrant's result SMS is sent **at most once** — atomic `result_sms_state null→sending` claim (committed before the POST), then 2xx→`sent` (accepted), a sync 4xx→`failed`, a *caught* 5xx/timeout/connection-loss/no-response→`unknown`. **Distinct crash windows (neither is `unknown` nor ever resent):** a worker killed *before* the `null→sending` claim commits leaves `null` (zero attempts); killed *after* leaves a persistent `sending`. **Never retried** (no double-text); `result_sms_sent_at` set only on `sent`. |
 | TC-056 | I | **Provider-side opt-out (not mirrored):** STOP/START/HELP are handled by Twilio Advanced Opt-Out on the Messaging Service; the app has **no** inbound webhook and **no** `PhoneBlock`. A send to a STOP'd number is still **accepted** (`sent`); the async `21610` is unobserved (correct — they opted out). Texting START (to Twilio) lets later sends deliver again. Application consent (`sms_opt_out`, FR-42) is independent — one of two duplicate-phone registrations can decline while the other still receives SMS. |
-| TC-057 | D | **SMS deploy smoke:** with a Messaging Service whose US sender is registered (A2P 10DLC Brand+Campaign, or verified toll-free) and Advanced Opt-Out enabled, send one live result-SMS to a real handset and confirm it is accepted (2xx) and arrives — before declaring SMS deployable. (Catches unregistered-sender blocking, which surfaces only against real US carriers.) |
+| TC-057 | D | **SMS deploy smoke — sender registration + Advanced Opt-Out (FR-43/NFR-3):** against the production Messaging Service whose US sender is registered (A2P 10DLC Brand+Campaign, or verified toll-free), verify on a **real US handset** before declaring SMS deployable — (a) send one live result-SMS → accepted (2xx) and arrives (catches unregistered-sender blocking, which surfaces only against real US carriers); (b) **Advanced Opt-Out is actually enabled** (it is **off by default**): from the handset text **STOP** → confirm the configured STOP auto-reply, then send another result-SMS and assert it is **blocked** (does not arrive — the provider honored the opt-out); (c) text **HELP** → confirm the configured HELP reply; (d) text **START** → confirm the configured START reply, then send another result-SMS and assert **delivery is restored**. SMS is not deployable until all four pass. |
 
 ---
 
@@ -154,7 +154,8 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 - **SMS delivery & provider opt-out:** TC-055 (fire-and-forget: one send, 2xx→sent (accepted) /
   4xx→failed / 5xx→unknown, never retried; at-most-one) and TC-056 (STOP/START handled provider-side
   by Advanced Opt-Out — not mirrored; async `21610` unobserved; app-consent independent) cover FR-17
-  and FR-43. TC-057 is the live SMS deploy smoke (registered US sender).
+  and FR-43. TC-057 is the live SMS deploy smoke: registered US sender + verifies Advanced Opt-Out is
+  actually enabled (STOP→blocked / HELP / START→restored on a real handset), mapped to FR-43/NFR-3.
 - **Labels:** TC-031/TC-040 verify grouped pet labels (~3/label), not one-per-animal.
 - **Test automation targets:** unit (TC-002, TC-009, TC-012, TC-013, TC-015) and integration
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
