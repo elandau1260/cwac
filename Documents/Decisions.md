@@ -14,7 +14,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 2 — Owner edit-link window (FR-22)
-**Decision:** Edit link valid from the signup SMS until the registration is checked-in (or the event completes); no pre-lottery gap because the link is sent at signup. Two SMS touchpoints total (signup confirmation + lottery result).
+**Decision:** Two contracts for the edit link (FR-22/FR-41): (a) the token-authenticated **GET/status view never expires** — it renders for as long as the event data exists, even after check-in/event-completion; (b) owner **mutation** (edit/add/remove animals) is accepted only **until the registration is checked-in or the event completes** (add is additionally limited to the open window). After check-in/completion, GET still renders (with a "locked" notice) but POST/mutation is rejected server-side. The link is sent at signup (no pre-lottery gap). Two SMS touchpoints total (signup confirmation + lottery result).
 **Your answer:** ✅ Confirmed — two-text flow.
 
 ---
@@ -26,7 +26,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 4 — AnimalID assignment (FR-14)
-**Decision:** The lottery **randomly selects** people (not in signup order, so people who borrowed a phone aren't disadvantaged), then assigns **sequential AnimalIDs starting at 1** (1, 2, 3, …), **max 999**, to selected + waitlisted. Manual admin additions take the next available number. Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next animal." Uniqueness is DB-enforced.
+**Decision:** The lottery **randomly selects** people (not in signup order, so people who borrowed a phone aren't disadvantaged), then assigns **sequential AnimalIDs starting at 1** (1, 2, 3, …), **max 999**, to selected + waitlisted. Manual additions by **staff (admin or volunteer)** take the next available number; assigning an ID to a `registered`/`not_selected` row also admits it (`status` → `selected`). Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next animal." Uniqueness is DB-enforced.
 **Your answer:** ✅ Confirmed — random selection + sequential IDs.
 ✅ **Confirmed:** start value is **1** (sequential 1, 2, 3, …; max 999). Resolved 2026-08-02 — matches the Implementation Plan, Requirements, and the data model (`next_animal_id` = max+1 else 1).
 
@@ -39,8 +39,8 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 6 — Lottery re-run / edge cases (FR-12, FR-36, FR-37)
-**Decision:** The lottery is a **single run**; it is not re-run or tweaked. For edge cases (walk-ins, people who couldn't register online), the admin can manually create registrations and assign an AnimalID (next in the 1–999 sequence). Uniqueness is DB-enforced.
-**Your answer:** ✅ Confirmed — single run; admin manual add + assign IDs.
+**Decision:** The lottery is a **single run**; it is not re-run or tweaked. For edge cases (walk-ins, people who couldn't register online), **staff (admin or volunteer)** can manually create registrations and assign an AnimalID (next in the 1–999 sequence); assigning an ID to a `registered`/`not_selected` row admits it (`status` → `selected`, atomically with the ID). Uniqueness is DB-enforced.
+**Your answer:** ✅ Confirmed — single run; **staff (admin or volunteer)** manual add + assign IDs (assigning an ID to a `registered`/`not_selected` row admits it → `selected`).
 
 ---
 
@@ -93,7 +93,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 15 — SMS delivery: fire-and-forget; STOP/START provider-side (FR-43)
-**Decision (revised — see note):** SMS is a **convenience** channel; the edit-link status page (FR-41) is the reliable one, so delivery is **fire-and-forget: best-effort, at-most-once, never retried.** `sent` means Twilio **accepted** the API request (2xx, queued) — not delivered. Each result SMS is sent **at most once** — atomically claim `result_sms_state null→sending` (committed before the Twilio POST), then classify the synchronous response: **2xx → `sent`**; **4xx (e.g. invalid number) → `failed`**; **5xx / connection error / timeout / crashed worker → `unknown`** (not retried). Because nothing is ever re-sent, at-most-once is trivially true (no double-texts); a crash can leave zero attempts or a persistent `sending`, neither resent. There is no `retry_sms`, no delivery-status callback, no per-message `StatusCallback`, and no `SmsAttempt`/`PhoneBlock` model. All SMS edit-links are built from one `PUBLIC_BASE_URL`. Delivery is not guaranteed, backstopped by the edit-link status page.
+**Decision (revised — see note):** SMS is a **convenience** channel; the edit-link status page (FR-41) is the reliable one, so delivery is **fire-and-forget: best-effort, at-most-once, never retried.** `sent` means Twilio **accepted** the API request (2xx, queued) — not delivered. Each result SMS is sent **at most once** — atomically claim `result_sms_state null→sending` (committed before the Twilio POST), then classify the synchronous response: **2xx → `sent`**; **4xx (e.g. invalid number) → `failed`**; **5xx / connection error / timeout / no response → `unknown` (a *caught* exception — a process crash is **not** `unknown`; a dead worker cannot write its own state, so it leaves `null` before the claim or `sending` after)** (not retried). Because nothing is ever re-sent, at-most-once is trivially true (no double-texts); a crash can leave zero attempts or a persistent `sending`, neither resent. There is no `retry_sms`, no delivery-status callback, no per-message `StatusCallback`, and no `SmsAttempt`/`PhoneBlock` model. All SMS edit-links are built from one `PUBLIC_BASE_URL`. Delivery is not guaranteed, backstopped by the edit-link status page.
 
 **STOP/START are handled provider-side** by Twilio **Advanced Opt-Out** on the Messaging Service (Twilio maintains the per-number blocklist and replies with the keyword text). A send to a blocked number is still **accepted** (`sent`); Twilio fails it **asynchronously** with `21610`, which the app does **not** observe (no callback) — the desired outcome for an opted-out number. The app does **not** receive an inbound webhook and does **not** mirror Twilio's blocklist, so there is no opt-out state to keep ordered or reconciled. The only app-side SMS gate is application consent (`sms_opt_out`, FR-42): a send goes out iff that registration's consent is clear. Re-consent of a provider-blocked number is by texting START (Twilio unblocks).
 
@@ -103,5 +103,11 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 
 ---
 
+## Decision 16 — Admin vs volunteer privileges (FR-30)
+**Decision:** **Differentiated privileges** (supersedes the earlier "same privileges" wording). **Admin-only** capabilities: create / configure / delete events (FR-1/FR-39), run the lottery (FR-12 — the noon auto-run via cron is system-level, not a user privilege — FR-40), and export data (FR-29). **Both roles** perform all clinic-day operations: look up, edit, add, remove, check-in, print, manual entry, and assign AnimalID (FR-23..FR-28, FR-35..FR-37). **Provisioning:** Admin → `is_staff=True` (Django-admin access); Volunteer → `is_staff=False` (clinic views only); `is_superuser` stays `False` unless explicitly granted; `role` and `is_staff` are set together. **Enforcement:** Admin-only custom views use a `role == admin` mixin; the Django admin gates on `is_staff` (so volunteers cannot enter it).
+**Your answer:** ✅ Confirmed — Admin-only = event create/configure/delete + run lottery + export; both roles = all clinic operations.
+
+---
+
 ## Summary
-Decisions 1–15 are all confirmed — **no open items remain for V1**. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, applicant cap Z (Decisions 10–12), owner status-visibility/SMS consent (Decision 14), and SMS delivery/STOP-START (Decision 15) are reflected in Requirements/Architecture/Traceability as **FR-38..FR-43**.
+Decisions 1–16 are all confirmed — **no open items remain for V1**. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, applicant cap Z (Decisions 10–12), owner status-visibility/SMS consent (Decision 14), SMS delivery/STOP-START (Decision 15), and the Admin/volunteer privilege split (Decision 16) are reflected in Requirements/Architecture/Traceability as **FR-30, FR-38..FR-43**.

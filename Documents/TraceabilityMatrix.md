@@ -13,13 +13,13 @@ are in §2.
 
 | Req ID | Requirement (short) | Test Cases |
 |---|---|---|
-| **FR-1** | Admin creates event with full configuration (incl. open/close times) | TC-001 |
+| **FR-1** | Admin creates event with full configuration (incl. open/close times) — **Admin-only** (Decision 16) | TC-001 |
 | **FR-2** | Unique event sign-up URL/slug | TC-002 |
 | **FR-3** | Download sign-up URL + QR-code JPG | TC-003 |
 | **FR-4** | Lifecycle; signups only during [open_at, close_at) (auto, no manual lock) | TC-004 |
 | **FR-34** | After close_at: owners edit/remove only (no add); admin can always add/edit | TC-041 |
 | **FR-38** | Per-event applicant cap Z (soft) rejects new signups when full; slight concurrent overshoot ok | TC-047 |
-| **FR-39** | Admin can delete an entire event (cascade) behind a confirmation | TC-048 |
+| **FR-39** | Admin can delete an entire event (cascade) behind a confirmation — **Admin-only** (Decision 16) | TC-048 |
 | **FR-5** | Public form via event URL, no login | TC-005 |
 | **FR-6** | EN/ES language toggle | TC-006 |
 | **FR-7** | Owner info (all required) + ≥1 animal submitted | TC-007, TC-008, TC-051 |
@@ -28,7 +28,7 @@ are in §2.
 | **FR-10** | Max 6 animals enforced on owner additions during open window (edit-form max tracks current count) | TC-008, TC-052 |
 | **FR-11** | Confirmation screen (no guaranteed time) | TC-011 |
 | **FR-12** | Lottery randomly selects whole registrations (single run, after close; no double-run under concurrent manual+auto) | TC-012, TC-013, TC-050 |
-| **FR-13** | X/Y caps (may overshoot ≤ max animals/person) | TC-012 |
+| **FR-13** | X/Y caps (may overshoot ≤ **M** = largest eligible reg's animal count; ≤6 normally, more only if staff grew a record past 6 — TC-052) | TC-012 |
 | **FR-14** | AnimalID sequential from 1 (max 999) to selected + waitlisted | TC-014, TC-015 |
 | **FR-15** | Statuses set correctly | TC-014 |
 | **FR-40** | Lottery auto-runs at noon (event tz) day-after-close if not run manually (single-run) | TC-049, TC-050 |
@@ -49,10 +49,10 @@ are in §2.
 | **FR-27** | Mark checked_in (manual fallback) | TC-030 |
 | **FR-28** | Print owner label + pet labels (grouping ~3 animals each) | TC-031 |
 | **FR-35** | Printing sets printed_at (attendance) | TC-043 |
-| **FR-36** | Admin manually creates a registration (owner + animals) | TC-044 |
-| **FR-37** | Admin assigns/edits an AnimalID, unique within event | TC-045 |
-| **FR-29** | Admin Excel/CSV export, agreed columns (incl. language) | TC-032 |
-| **FR-30** | Admin+volunteer login, same privileges | TC-033, TC-034, TC-035 |
+| **FR-36** | Staff (admin or volunteer) manually creates a registration (owner + animals); assigning its ID admits it (→ `selected`) | TC-044 |
+| **FR-37** | Staff assigns/edits an AnimalID, unique within event; assigning to a `registered`/`not_selected` row admits it (→ `selected`) | TC-045 |
+| **FR-29** | Admin Excel/CSV export, agreed columns (incl. language) — **Admin-only** (Decision 16) | TC-032 |
+| **FR-30** | Admin+volunteer login; **Admin-only** = event create/configure/delete + run lottery + export; **both roles** = all clinic operations (Decision 16) | TC-033, TC-034, TC-035 |
 | **FR-31** | Owner pages no login (token-secured) | TC-005, TC-020 |
 | **FR-32** | HTTPS; no public listing | TC-036, TC-038 |
 | **FR-33** | EN/ES public form + SMS; chosen language stored (admin UI English-only) | TC-006, TC-018, TC-046 |
@@ -72,7 +72,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-001 | E2E | Admin creates an event with all config fields (incl. open/close times) → saved with status `draft`. |
 | TC-002 | U | Slug generation yields a unique code; a duplicate is rejected. |
 | TC-003 | E2E | Admin downloads sign-up URL + QR JPG → file downloads and the QR decodes to the event URL. |
-| TC-004 | I | Submit before `open_at` or after `close_at` → rejected; submit during the window → accepted. (No manual lock.) |
+| TC-004 | I | Submit before `open_at` or after `close_at` → rejected; submit during the window on a **`live`** event → accepted. **A `draft` (or any non-`live`) event rejects signups even within `[open_at, close_at)`** — the `live` stage is required, not just the time window (FR-4). (No manual lock.) |
 | TC-005 | E2E | Open the sign-up URL (during the window) while logged out → form renders (no login wall). |
 | TC-006 | E2E | Toggle to ES → every public label renders in Spanish; toggle back to EN. |
 | TC-007 | I | Submit with a missing required owner field (name/phone/email/address) → blocked with validation errors. |
@@ -80,7 +80,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-009 | I | Per-animal required fields enforced; no "weight" field present anywhere in the form or model. |
 | TC-010 | E2E | Event offers only `vaccination`+`vet` → form shows only those service checkboxes + last-vaccinated + medical-concern; hides flea/microchip. |
 | TC-011 | E2E | Valid submission → confirmation screen appears and states no guaranteed time. |
-| TC-012 | U | With seeded registrations/animal-counts, lottery selects whole people; selected animal sum ≥ X and < X + max-per-person; waitlist sum ≥ Y and < Y + max-per-person. |
+| TC-012 | U | With seeded registrations/animal-counts, lottery selects whole people; let **M** = the largest animal count among the eligible registrations — selected animal sum ≥ X and < X + M; waitlist sum ≥ Y and < Y + M. **Include a staff-grown >6-animal registration (TC-052) and assert the bound holds with M = that count** (for typical all-owner rows M=6, so the bound is < X+6 / < Y+6). |
 | TC-013 | U | Lottery selection is random (not signup order): shuffle is invoked and selection changes across runs (distribution check over many seeded runs). |
 | TC-014 | I | After lottery, every selected+waitlisted registration has a unique AnimalID and the correct status; `not_selected` have no AnimalID. |
 | TC-015 | U | AnimalIDs are sequential starting at 1 (1..N), contiguous, max 999, unique within the event. |
@@ -102,7 +102,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-031 | I | Volunteer triggers print → print station receives a label payload = 1 owner label + pet labels that group the record's animals (~3 each). |
 | TC-032 | I | Admin exports an event → CSV/XLSX downloads with the agreed columns and every registration+animal (incl. status, AnimalID, language, printed). |
 | TC-033 | M | Admin login with correct creds → access; wrong creds → denied. |
-| TC-034 | E2E | Volunteer login → can edit/export the same as admin (same privileges). |
+| TC-034 | E2E | **Privilege contract (Decision 16):** a volunteer can perform every clinic operation (lookup, edit, add, remove, check-in, print, manual entry, assign AnimalID) but is **denied** each Admin-only capability — create/configure/delete event, run lottery, export — and cannot enter the Django admin (`is_staff=False`). An admin can do all of the above. Assert each Admin-only action is rejected for the volunteer role. |
 | TC-035 | E2E | Unauthenticated request to any admin/volunteer page → redirected to login. |
 | TC-036 | E2E | A direct URL to another event's data without selecting it → denied/redirect (no cross-event leak). |
 | TC-037 | M | Public form is usable one-handed on a phone: tap-target sizes, font sizes, no horizontal scroll. |
@@ -112,18 +112,18 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-041 | I | After `close_at`: new signups rejected; an owner's add-animal is blocked (edit/remove still work); the admin can still add/edit. |
 | TC-042 | E2E | After `close_at`, the owner edit page shows no working add-animal control (remove/edit still function). |
 | TC-043 | I | Printing labels for a registration sets `printed_at`; the registration then reports as attended/printed in admin + export. |
-| TC-044 | I | Admin creates a registration manually (owner + animals) → saved with `created_by`=admin; lookup-able by name/phone; the 6-animal cap is not enforced. |
-| TC-045 | I | Admin assigns an AnimalID to a registration → accepted if unique within the event (1..999); a duplicate is rejected; the entry is then lookup-able by that AnimalID. |
+| TC-044 | I | **Staff (admin or volunteer)** creates a registration manually (owner + animals) → saved with `created_by`=staff; lookup-able by name/phone; the 6-animal cap is not enforced. The row starts `registered`; **assigning its AnimalID (TC-045) admits it → `status='selected'` atomically**, and the owner's status banner then shows the ID. |
+| TC-045 | I | **Staff (admin or volunteer)** assigns an AnimalID to a registration → accepted if unique within the event (1..999); a duplicate is rejected; the entry is then lookup-able by that AnimalID. **Assigning an ID to a `registered`/`not_selected` row atomically sets `status='selected'` (admit)** — assert the owner's status banner shows the AnimalID, clinic lookup finds it by ID, and export reflects the admitted status. A `selected`/`waitlisted`/`checked_in` row keeps its status (ID set only). |
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
 | TC-047 | I | **Deterministic:** at `count == Z`, a new signup is rejected with an EN/ES "registration full" message; at `Z-1`, a single new signup is accepted; an existing owner at the event can still add an animal regardless of Z. **Soft-cap race (residual/load, not a unit assertion):** Z is a soft cap — the check + insert are not serialized, so concurrent signups at `Z-1` may overshoot by up to the number of requests in flight at the boundary. There is no hard ≤Z invariant; the overshoot is observed/verified under load, not asserted as a deterministic bound (R-10/Decision 12). |
 | TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
-| TC-049 | I | `run_due_lotteries` runs a **`live`** event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched; and an **expired `draft`** (or any non-`live` event) past its deadline is **not** run (TC requires Postgres for the row lock). |
+| TC-049 | I | `run_due_lotteries` runs a **`live`** event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched; and an **expired `draft`** (or any non-`live` event) past its deadline is **not** run; and a **direct call to `run_lottery` on a `live` event before `close_at` raises `LotteryNotEligible`** (FR-12 — the shared service guards `now > close_at` under the Event-row lock, not just the admin action). (TC requires Postgres for the row lock.) |
 | TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same `live` event → exactly one run wins (statuses/IDs set once); each registrant gets **at most one** result SMS (fire-and-forget: a crash can mean zero, never two). Requires Postgres. |
 | TC-051 | I | Submitting a registration with zero animals → blocked (≥1 animal required); submit with 1 → accepted. |
 | TC-052 | I | An owner record a volunteer grew to 8 animals can still be edited/removed by the owner (max tracks current count); an owner at 6 cannot add a 7th. |
 | TC-053 | I | Open the edit link after the lottery: selected/waitlisted → shows their AnimalID; not-selected → shows a "not selected" notice; before the lottery → "pending". Status **still renders after the edit locks** (check-in / event complete) — GET shows the banner + "locked"; only mutation is blocked. |
 | TC-054 | I | Signup form shows an SMS-consent checkbox checked by default. Submit with it unchecked → `sms_opt_out=True`, no SMS sent (signup or result); status still visible on the edit-link page. Leave checked (or re-check via the edit link) → SMS sends normally. |
-| TC-055 | I | **Fire-and-forget result SMS:** a consenting registrant's result SMS is sent **at most once** — atomic `result_sms_state null→sending` claim (committed before the POST), then 2xx→`sent` (accepted), a sync 4xx→`failed`, a 5xx/timeout/connection-loss/crash→`unknown`; **never retried** (no double-text); `result_sms_sent_at` set only on `sent`. A crash can leave `null` (zero attempts) or `sending` — neither resent. |
+| TC-055 | I | **Fire-and-forget result SMS:** a consenting registrant's result SMS is sent **at most once** — atomic `result_sms_state null→sending` claim (committed before the POST), then 2xx→`sent` (accepted), a sync 4xx→`failed`, a *caught* 5xx/timeout/connection-loss/no-response→`unknown`. **Distinct crash windows (neither is `unknown` nor ever resent):** a worker killed *before* the `null→sending` claim commits leaves `null` (zero attempts); killed *after* leaves a persistent `sending`. **Never retried** (no double-text); `result_sms_sent_at` set only on `sent`. |
 | TC-056 | I | **Provider-side opt-out (not mirrored):** STOP/START/HELP are handled by Twilio Advanced Opt-Out on the Messaging Service; the app has **no** inbound webhook and **no** `PhoneBlock`. A send to a STOP'd number is still **accepted** (`sent`); the async `21610` is unobserved (correct — they opted out). Texting START (to Twilio) lets later sends deliver again. Application consent (`sms_opt_out`, FR-42) is independent — one of two duplicate-phone registrations can decline while the other still receives SMS. |
 | TC-057 | D | **SMS deploy smoke:** with a Messaging Service whose US sender is registered (A2P 10DLC Brand+Campaign, or verified toll-free) and Advanced Opt-Out enabled, send one live result-SMS to a real handset and confirm it is accepted (2xx) and arrives — before declaring SMS deployable. (Catches unregistered-sender blocking, which surfaces only against real US carriers.) |
 
@@ -139,8 +139,12 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 - **Random selection:** TC-013 verifies the lottery selects in random order, not signup order.
 - **Language:** TC-046 verifies the chosen language is stored and drives SMS (FR-18/FR-33).
 - **Attendance:** TC-043 verifies printing records attendance (FR-35).
-- **Admin manual ops:** TC-044 (create entry) and TC-045 (assign AnimalID) cover the post-lottery
-  edge-case handling in FR-36/FR-37.
+- **Manual entry & AnimalID (both roles):** TC-044 (create entry) and TC-045 (assign AnimalID —
+  admitting `registered`/`not_selected` rows by setting `status='selected'`) cover the post-lottery
+  edge-case handling in FR-36/FR-37; both operations are available to admin **and** volunteer.
+- **Privileges (Decision 16):** TC-034 verifies the differentiated contract — volunteer can do all
+  clinic operations but is denied each Admin-only capability (event create/configure/delete, run
+  lottery, export; no Django-admin access).
 - **Applicant cap / deletion / auto-lottery:** TC-047 (cap Z), TC-048 (event deletion), and
   TC-049/TC-050 (noon auto-run + no concurrent double-run) cover FR-38..FR-40.
 - **Formset invariant:** TC-051 (≥1 animal required) and TC-052 (over-cap owner edit) cover

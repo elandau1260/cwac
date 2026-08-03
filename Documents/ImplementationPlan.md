@@ -45,7 +45,7 @@ Architecture, Decisions, TraceabilityMatrix). **43 FRs (FR-1..FR-43) + 4 NFRs.**
 | QR | `qrcode` 7.4 + Pillow 10 → JPG for flyers |
 | Export | stdlib `csv` (streaming) + `openpyxl` 3.1 (XLSX) |
 | Phones | `phonenumbers` 8.13 — US-region validate + E.164 normalize (SMS deliverability) |
-| Auth | `accounts.User(AbstractUser)` + `role` label; session auth via `LoginRequiredMixin` |
+| Auth | `accounts.User(AbstractUser)` + `role` (admin/volunteer); **differentiated privileges** (FR-30/Decision 16): Admin-only = event create/configure/delete, run lottery, export; both roles = clinic ops (lookup/edit/add/remove/check-in/print/manual entry/assign AnimalID); session auth via `LoginRequiredMixin` + a `role == admin` mixin for Admin-only views |
 | Timezone | `django-timezone-field` (per-event IANA select); custom admin form so `open_at`/`close_at` are entered **and** displayed in the event's tz (stored UTC, `USE_TZ=True`) — drives the per-event "noon" auto-lottery deadline |
 
 **Window mechanism (FR-4/34) — read-time, no cron.** Source of truth = computed methods on `Event`,
@@ -112,10 +112,13 @@ migration is made.
   result-SMS status for admin/export ("did this reg get its result SMS?"). Atomically claim
   `null→sending` before the send (only the claimant sends), then classify: `sent` = Twilio **accepted
   the API request** (2xx, queued — not delivered); `failed` on a **synchronous** rejection (4xx, e.g.
-  invalid number `21211`); `unknown` on an ambiguous outcome (5xx / connection error / timeout /
-  crashed worker). **Never retried** — one send per registration, so at-most-once is trivially true.
-  A crash can leave `null` (zero attempts) or a persistent `sending`; neither is resent. Best-effort;
-  the edit-link status page is the reliable channel (FR-41).
+  invalid number `21211`); `unknown` on a **caught** ambiguous outcome (5xx / connection error /
+  timeout / no response) — an exception the worker trapped and classified itself. **A process crash
+  is NOT `unknown`**: a dead worker cannot write its own state, so it leaves `null` (if it died
+  before the claim) or a persistent `sending` (if it died after). **Never retried** — one send per
+  registration, so at-most-once is trivially true; `null` (zero attempts) and `sending` are both
+  acceptable and **neither is ever resent**. Best-effort; the edit-link status page is the reliable
+  channel (FR-41).
 - `result_sms_sent_at` DateTimeField(null, blank, set only when state=`sent`)
 - `sms_opt_out` BooleanField(default=False) — **application-level consent** (the only app-side SMS
   gate), registration-local. Changed only by the owner: the signup consent checkbox (FR-42) and the
@@ -138,7 +141,7 @@ migration is made.
 - **No `weight` field** (FR-8/TC-009)
 
 ### `accounts.User`
-`AbstractUser` + `role` choices admin/volunteer (default volunteer). **Same privileges V1** — role for logging only.
+`AbstractUser` + `role` choices admin/volunteer (default volunteer). **Differentiated privileges (FR-30/Decision 16):** Admin-only = create/configure/delete events, run the lottery, export data (an Admin additionally does everything a volunteer can); **both roles** do clinic operations — lookup, edit, add, remove, check-in, print, manual entry, assign AnimalID. **Provisioning:** Admin → `is_staff=True` (Django-admin access); Volunteer → `is_staff=False` (clinic views only); `is_superuser` stays `False` for both unless explicitly granted. **Enforcement:** Admin-only custom views use a `role == admin` mixin; the Django admin gates on `is_staff` (so volunteers cannot enter it); `role` and `is_staff` are set together at provisioning (the `ensure_admin` command and any user-create flow keep them consistent).
 
 ---
 
@@ -149,19 +152,23 @@ migration is made.
 the whole body runs inside one `transaction.atomic()`. It first **locks and reloads the `Event`
 row** (`Event.objects.select_for_update().get(pk=event.pk)`), then performs the single-run guard
 on that locked row — `raise LotteryAlreadyRun if event.lottery_run_at is not None`, and
-`raise LotteryNotEligible if event.status != 'live'` (Decision 6; gates out drafts/expired events
-that happen to have passed timestamps — TC-049). Locking the Event row (not just the registrations)
+`raise LotteryNotEligible if event.status != 'live' or now <= event.close_at` (**FR-12:** the
+lottery runs only on a **live** event and only **after close** — this is the authoritative guard,
+under the Event-row lock; the admin action's `status == 'live'` / `now > close_at` checks are just
+UX pre-filtering). This gates out drafts, non-live events, and before-close calls (TC-049). Locking the Event row (not just the registrations)
 is what makes a manual click and the noon cron unable to double-run: the second caller blocks until
 the first commits, re-reads a non-null `lottery_run_at`, and exits (TC-050). Then
 `select_for_update()` on the event's `registered` rows:
 
-0. Reload + lock the `Event` row; guard `lottery_run_at is None` **and** `status == 'live'`.
+0. Reload + lock the `Event` row; guard `lottery_run_at is None` **and** `status == 'live'` **and** `now > close_at` (FR-12).
 1. `rng.shuffle(regs)` — random, **not** signup order (TC-013). Default `rng = random.Random()`.
 2. Single pass, tagging each reg's bucket: while `sel_total < x_seen` → `selected` (+n animals);
    elif `wl_total < y_waitlist` → `waitlisted` (+n); else `not_selected`.
-   - **Overshoot proof:** the boundary reg is added only while the running total is still below the
-     cap; before it the total was ≤ cap−1 and the reg has ≤ 6 animals → final ∈ `[cap, cap+5] ⊂
-     [cap, cap+6)`. Satisfies FR-13/TC-012.
+   - **Overshoot proof:** let **M** = the largest animal count among the eligible registrations
+     (≤6 for owner-submitted rows; larger only for a record staff grew past 6 — FR-25/36/TC-052).
+     The boundary reg is added only while the running total is still below the cap; before it the
+     total was ≤ cap−1 and that reg has ≤ M animals → final ∈ `[cap, cap+M−1] ⊂ [cap, cap+M)`. For
+     the typical all-owner case (M=6) this is the original `[cap, cap+5]`. Satisfies FR-13/TC-012.
 3. Second pass over **same shuffled order**: for each reg tagged selected/waitlisted, assign
    `animal_id = next_id` (from 1); raise `LotteryCapacityExceeded` if `next_id > 999` (FR-14).
    `not_selected` get no ID.
@@ -186,8 +193,9 @@ banner as a no-cron fallback.
 
 ### Window / open-close
 All gating calls `event.signup_open()` / `owner_can_add()` / `owner_can_edit()` — never the raw
-`status` column. After `close_at`: new signups rejected, owner **add** disabled, edit/remove still
-allowed (FR-34/41/42). Admin can always add/edit.
+`status` column. After `close_at`: new signups rejected, owner **add** disabled, **edit/remove still
+allowed until check-in/event-completion** (after that, mutation locks — POST rejected — but GET
+still renders: FR-41). Admin can always add/edit.
 
 ### Token edit (`/r/<slug>/edit/<token>/`)
 Public, no login (FR-20). `Registration.select_related('event').get(event__slug=slug,
@@ -229,7 +237,7 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
   claimant sends, committed **before** the Twilio POST), then classify the **synchronous response**:
   - **HTTP 2xx** → `result_sms_state='sent'` + `result_sms_sent_at` (accepted/queued; not tracked further).
   - **4xx** (synchronous rejection, e.g. invalid number `21211`) → `result_sms_state='failed`. Logged.
-  - **5xx / connection error / timeout / no response / crashed worker** → `result_sms_state='unknown`.
+  - **5xx / connection error / timeout / no response** (a *caught* exception the worker classified) → `result_sms_state='unknown'`. **Process crash / hard kill is not `unknown`** — a dead worker cannot update its own row: it leaves `null` (died before the claim) or a persistent `sending` (died after); neither is resent.
   Nothing is ever retried, so there are **no double-texts** ("at most one" send per registration —
   not "exactly one": best-effort means a crash between the lottery commit and notification can leave
   a registration at **zero attempts** (`null`), and a crash after the claim can leave a persistent
@@ -295,16 +303,16 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 |---|---|---|---|
 | **0 Scaffolding** | `git init`; `.gitignore`; `startproject config .` + settings split; 8 app packages; requirements; `runtime.txt`; `render.yaml`; `.env.example`; `templates/` `static/` `locale/` | `manage.py`, `config/settings/base.py`, `config/urls.py`, `requirements/base.txt`, `render.yaml` | NFR-2 plumbing |
 | **1 Models + admin** | All 4 models (`Event`, `Registration`, `Animal`, `User`), `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS on `Registration`: `result_sms_state`/`_sent_at` (fire-and-forget) + `sms_opt_out` (application consent); no SMS-specific models; full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `*/admin.py` | FR-1/2/8/14/37/38; TC-002, TC-009, TC-047 |
-| **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade) behind a confirmation warning (R-9) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32/39; TC-001/003/033/035/048 |
+| **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade, **Admin-only**) behind a confirmation warning (R-9); event create/configure are likewise **Admin-only** (role-gated — Decision 16) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32/39; TC-001/003/033/035/048 |
 | **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z soft applicant cap → friendly full message; slight overshoot ok)**; `OwnerForm` (+ `sms_consent` checkbox, default on) + dynamic `AnimalFormSet(min_num=1, max_num=6)`; confirmation screen (no guaranteed time; shows the edit link even if SMS was declined); persist language; fire SMS #1 to consenters | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33/38/42; TC-004/005/006/007/008/010/011/016/037/046/047/051/054 |
-| **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); edit/remove always; **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
-| **5 Lottery** | `run_lottery` service (Event-row lock + post-lock guard) + exceptions; admin "Run lottery" action; `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4/FR-40) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15/40; TC-012/013/014/015/049/050 |
-| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting** registrant in stored language (gate: `not sms_opt_out`); **fire-and-forget** send — atomic `result_sms_state null→sending` claim committed before the POST, classify 2xx→`sent` (accepted), 4xx→`failed` (sync, e.g. invalid number), 5xx/conn/timeout/crash→`unknown`; **never retried**, no callback, no webhook. STOP/START left to Twilio Advanced Opt-Out (not mirrored, async `21610` unobserved). Edit link via `absolute_url`/`PUBLIC_BASE_URL`; wired after lottery run | `sms/templates.py`, `sms/{services,backends/*}.py`, `lottery/services.py` | FR-17/18/19; TC-017/018/019/055/056 |
+| **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); **edit/remove until check-in/event-completion** (mutation locks after that; GET always renders — FR-41); **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
+| **5 Lottery** | `run_lottery` service (Event-row lock + post-lock guard) + exceptions; admin "Run lottery" action (**Admin-only**; the cron auto-run is system-level, not a user privilege — Decision 16); `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4/FR-40) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15/40; TC-012/013/014/015/049/050 |
+| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting** registrant in stored language (gate: `not sms_opt_out`); **fire-and-forget** send — atomic `result_sms_state null→sending` claim committed before the POST, classify 2xx→`sent` (accepted), 4xx→`failed` (sync, e.g. invalid number), 5xx/conn/timeout/no-response→`unknown` (process crash leaves `null`/`sending`); **never retried**, no callback, no webhook. STOP/START left to Twilio Advanced Opt-Out (not mirrored, async `21610` unobserved). Edit link via `absolute_url`/`PUBLIC_BASE_URL`; wired after lottery run | `sms/templates.py`, `sms/{services,backends/*}.py`, `lottery/services.py` | FR-17/18/19; TC-017/018/019/055/056 |
 | **7 Clinic check-in + lookup** | `LoginRequiredMixin` views: `select_event` (session), `lookup` (AnimalID exact / fuzzy name+phone, **event-scoped**), `detail` (editable, `max_num=None`), add/remove/save, `check_in`; ordered waitlist list (no promotion) | `clinic/{views,urls}.py`, `templates/clinic/*` | FR-23/24/25/26/27; TC-025/026/027/028/029/030/034/036 |
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
-| **9 Export** | CSV streaming + XLSX builders | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
-| **10 Admin manual entry + AnimalID** | Admin create Registration (`created_by=admin`, no cap); "next available" AnimalID button; `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; no webhooks — FR-43); **deploy smoke** — send one live result-SMS end-to-end and confirm it arrives before declaring SMS deployable (TC-057) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
+| **9 Export (Admin-only)** | CSV streaming + XLSX builders (role-gated: admin only — FR-29/Decision 16) | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
+| **10 Manual entry + AnimalID (both roles)** | Create Registration (`created_by=staff`, no 6-animal cap — FR-36) from the **clinic UI (both admin & volunteer)** plus the Django-admin back-office; "next available" AnimalID button (FR-37); **assigning an ID to a `registered`/`not_selected` row atomically sets `status='selected'`** (admit → status banner shows the ID, clinic-lookup-able, exported); `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `clinic/views.py`, `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command (creates the initial **Admin** with `is_staff=True`; **volunteers** are provisioned later with `is_staff=False` — Decision 16); **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; no webhooks — FR-43); **deploy smoke** — send one live result-SMS end-to-end and confirm it arrives before declaring SMS deployable (TC-057) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -392,7 +400,7 @@ no writable disk at runtime → collectstatic at build.
   concurrent manual click and cron run cannot double-run (TC-050). Auto path = `run_due_lotteries`
   command on a Render Cron Job (hourly) + an admin "overdue lottery" warning/one-click-run banner as
   a no-cron fallback. Result SMS is **fire-and-forget: at-most-once** (one send per registration —
-  2xx→`sent` (accepted), 4xx→`failed` (sync), 5xx/conn/timeout/crash→`unknown`; **never retried**, so no
+  2xx→`sent` (accepted), 4xx→`failed` (sync), 5xx/conn/timeout/no-response→`unknown` (process crash leaves `null`/`sending`); **never retried**, so no
   double-texts), best-effort (not guaranteed), and sent concurrently so ~Z texts finish quickly.
 - **R-5 Check-in concurrency — RESOLVED by design (verify at first busy event).** One volunteer/printer is the norm; two+ volunteers with
   two printers also work cleanly — that's exactly why Postgres (not SQLite). Duplicate AnimalIDs are

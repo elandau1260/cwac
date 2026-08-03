@@ -49,7 +49,7 @@ existing Flutter/Android app reused solely as the label-print station.
 
 **Actors / external systems**
 - **Owner** — uses the public form and the SMS edit link; no login.
-- **Admin / Volunteer** — logged-in staff (same privileges in V1).
+- **Admin / Volunteer** — logged-in staff. **Admin-only:** create/configure/delete events, run lottery, export; **both roles:** all clinic operations (Decision 16).
 - **Twilio** — outbound SMS: signup confirmation + lottery results.
 - **3nStar PPT305BT** — thermal label printer, reachable only via its Android SDK.
 - **Flutter/Android app** (`../vet_app`) — the print station; wraps the 3nStar native bridge.
@@ -70,7 +70,7 @@ existing Flutter/Android app reused solely as the label-print station.
 |  lottery/    random selection, sequential AnimalID assignment |
 |  sms/        Twilio integration, signup + result templates    |
 |  clinic/     volunteer lookup/edit/add/remove, check-in,      |
-|              print (sets printed_at); admin manual entry +    |
+|              print (sets printed_at); manual entry, both +    |
 |              AnimalID assignment                              |
 |  printing/   label-payload endpoint for the print station     |
 |  export/     CSV/XLSX download of an event's registrations    |
@@ -84,12 +84,12 @@ existing Flutter/Android app reused solely as the label-print station.
 
 | Component | Responsibility | Satisfies |
 |---|---|---|
-| `accounts` | Username/password login; both roles share privileges | FR-30, FR-32 |
+| `accounts` | Username/password login; **Admin-only** = event CRUD + lottery + export (`is_staff=True` → Django admin); **both roles** = clinic operations (Volunteer `is_staff=False`) | FR-30, FR-32 |
 | `events` | Create/configure events; `open_at`/`close_at` window (auto close, no manual lock); per-event applicant cap Z; unique slug; QR/URL download; delete entire event; back-office via Django admin | FR-1..FR-4, FR-34, FR-38, FR-39 |
 | `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; SMS-consent checkbox (default on); stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close); edit-link shows lottery result; SMS opt-out toggle | FR-5..FR-11, FR-20..FR-22, FR-33, FR-41, FR-42 |
 | `lottery` | Random shuffle + select whole registrations to X/Y caps; assign sequential AnimalIDs; set statuses; single-run guard (manual click + noon auto-run) | FR-12..FR-15, FR-40 |
 | `sms` | Send signup-confirmation + lottery-result SMS via Twilio (Messaging Service) in the registration's stored language; **fire-and-forget** (gate: `not sms_opt_out`; one send per reg, 2xx→`sent` (accepted) / 4xx→`failed` (sync) / 5xx→`unknown`, never retried); STOP/START handled provider-side by Advanced Opt-Out (not mirrored; async `21610` unobserved) | FR-16..FR-19, FR-42, FR-43 |
-| `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; admin manual entry create + AnimalID assignment | FR-23..FR-28, FR-35..FR-37 |
+| `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; manual entry create + AnimalID assignment (both roles; assigning an ID to a `registered`/`not_selected` row admits it → `selected`) | FR-23..FR-28, FR-35..FR-37 |
 | `printing` | Serve label payload (owner + grouped pet labels) to the print station | FR-28, NFR-4 |
 | `export` | CSV/XLSX export with the agreed columns | FR-29 |
 
@@ -123,22 +123,25 @@ Event 1──* Registration 1──* Animal
 
 (no SMS-specific models — delivery is fire-and-forget; STOP/START are Twilio's, not mirrored)
 
-User (admin/volunteer)  ── standalone, role label only (same priv)
+User (admin/volunteer)  ── standalone; differentiated privileges (Decision 16)
 ```
 
 Notes:
 - `AnimalID` is a sequential integer **from 1** (max 999), unique within the event, assigned to a
   **Registration** (identifies the owner + all their animals); **not** the DB primary key. It is
-  assigned by the lottery (in shuffled order) or **manually by an admin** (next available
-  number). Uniqueness is enforced by a DB constraint.
+  assigned by the lottery (in shuffled order) or **manually by staff (admin or volunteer)** (next
+  available number; assigning an ID to a `registered`/`not_selected` row admits it → `status='selected'`).
+  Uniqueness is enforced by a DB constraint.
 - `language` (EN/ES) chosen at signup is stored on the Registration and selects the SMS template.
 - `edit_token` is an unguessable random value created at signup; the only auth for owner
   self-edit (FR-20).
 - `printed_at` is set when labels print — the authoritative "showed up" signal (FR-35).
 - `services_offered` on the Event drives which per-animal fields/checkboxes render (FR-9).
 - Open/close is governed by `open_at`/`close_at`; there is no manual "lock" (Decision 8). The
-  app treats the event as open for signups when `open_at ≤ now < close_at` and the lottery
-  hasn't run. **The stored `status` column holds only discrete admin stages
+  app treats the event as **open for signups iff `status == 'live'` and `open_at ≤ now < close_at`**
+  (the `live` stage is required — a `draft`/non-live event rejects signups even inside the window;
+  once the lottery runs, `status` advances past `live`, which also closes signups). **The stored
+  `status` column holds only discrete admin stages
   (`draft`/`live`/`lottery_run`/`active`/`completed`); "open" vs "closed" is a computed read-time
   label, never stored (R-3).**
 
@@ -195,14 +198,15 @@ lottery app: inside transaction.atomic(): lock + reload the Event row (select_fo
             set `event.lottery_run_at = now` (the durable single-run guard)
             enqueue result SMS per registrant (all outcomes, in stored language)
 sms app:   fire-and-forget: atomically claim `result_sms_state null→sending` (committed before the
-           POST), then classify 2xx→`sent` (accepted), 4xx→`failed` (sync), **5xx/conn/timeout/crash→`unknown`**
+           POST), then classify 2xx→`sent` (accepted), 4xx→`failed` (sync), **5xx/conn/timeout/no-response→`unknown` (process crash leaves `null`/`sending`)**
            (never retried). Render EN/ES template --> Twilio (Messaging Service) --> owner phone
            (FR-17/18/19). Send gated on `not sms_opt_out` only (FR-42); STOP/START/HELP handled
            provider-side by Advanced Opt-Out (not mirrored, no webhook — a blocked number is accepted
            `sent`; the async `21610` is unobserved). URLs via `absolute_url`/`PUBLIC_BASE_URL`
 
-Post-lottery (admin, ad-hoc):
-clinic app: admin creates a registration (owner+animals) and/or assigns the next AnimalID
+Post-lottery (staff, ad-hoc — both roles):
+clinic app: staff (admin or volunteer) creates a registration (owner+animals) and/or assigns the next AnimalID
+            (assigning an ID to a registered/not_selected row admits it: status → selected);
             (DB enforces unique 1..999 within the event)         (FR-36/37)
 ```
 
@@ -210,7 +214,7 @@ clinic app: admin creates a registration (owner+animals) and/or assigns the next
 ```
 Owner --> /r/EVENT/edit/TOKEN (from SMS #1 or #2)
 register app: validate token + window/check-in state
-            --> render entry (add enabled only if window open; remove/edit always)
+            --> render entry (add enabled only if window open; remove/edit until check-in/event-completion)
             --> always show status banner: AnimalID / "not selected" / "pending" / checked-in (FR-41)
             --> SMS-preference toggle -> sets sms_opt_out (FR-42)
 Owner edits/adds(while open)/removes --> save
@@ -250,7 +254,7 @@ second UI.)
 
 ## 9. Security & Authentication
 
-- Admin/volunteer: Django session auth, username/password, **same privileges** (FR-30).
+- Admin/volunteer: Django session auth, username/password. **Admin-only:** event create/configure/delete, run lottery, export — enforced via a `role == admin` mixin on custom views plus `is_staff` gating on the Django admin (Admin provisioned `is_staff=True`, Volunteer `is_staff=False`) (FR-30/Decision 16). **Both roles:** all clinic operations (lookup, edit, add, remove, check-in, print, manual entry, assign AnimalID).
 - Owner self-edit: **no login**; gated by the unguessable `edit_token` and the window/check-in
   state (FR-20, FR-21, FR-22). Tokens are scoped to one registration.
 - HTTPS everywhere (NFR-2); no public listing of registrations (FR-32).
@@ -292,7 +296,7 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 3. ✅ SMS → two touchpoints (signup confirmation + lottery results); courtesy text to not-selected.
 4. ✅ AnimalID → **sequential from 1, max 999** (in shuffled order; start value confirmed = 1).
 5. ✅ Waitlist promotion → none in V1; `printed_at` tracks attendance.
-6. ✅ Lottery → single run; admin can manually add entries & assign AnimalIDs.
+6. ✅ Lottery → single run; **staff (admin or volunteer)** can manually add entries & assign AnimalIDs (assigning an ID to a `registered`/`not_selected` row admits it → `selected`).
 7. ✅ Admin/volunteer UI → English-only.
 8. ✅ Registration open/close → **timestamp-driven (`open_at`/`close_at`); no manual lock**.
 9. ✅ Pet labels → grouped (~3/label, exact count by print testing).
@@ -301,7 +305,8 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
-15. ✅ SMS delivery → **fire-and-forget** (one send per registration: 2xx→`sent` (accepted), 4xx→`failed` (sync), 5xx/conn/timeout/crash→`unknown`; **never retried**, so at-most-once is trivially true); STOP/START handled provider-side by Twilio Advanced Opt-Out (not mirrored, no webhook; async `21610` unobserved). Send gated on `not sms_opt_out`; URLs via `PUBLIC_BASE_URL` (FR-42/43).
+15. ✅ SMS delivery → **fire-and-forget** (one send per registration: 2xx→`sent` (accepted), 4xx→`failed` (sync), 5xx/conn/timeout/no-response→`unknown` (process crash leaves `null`/`sending`); **never retried**, so at-most-once is trivially true); STOP/START handled provider-side by Twilio Advanced Opt-Out (not mirrored, no webhook; async `21610` unobserved). Send gated on `not sms_opt_out`; URLs via `PUBLIC_BASE_URL` (FR-42/43).
+16. ✅ Admin/volunteer privileges → **differentiated**: Admin-only = event create/configure/delete + run lottery + export; both roles = all clinic operations. Admin `is_staff=True`, Volunteer `is_staff=False`; enforced via a `role == admin` mixin + Django-admin `is_staff` gate (FR-30/Decision 16).
 
 **Residual verification risks (not open decisions):**
 - Check-in concurrency — resolved by design (Postgres + the unique AnimalID index); verify under

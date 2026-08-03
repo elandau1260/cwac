@@ -29,12 +29,12 @@ AnimalID, edits as needed, and **prints labels**.
 - Registration **closes automatically at `close_at`** — after that, owners can edit/remove but not add
 - Admin "Create Event" with per-event configuration + unique sign-up URL + downloadable QR code
 - Random lottery (selects whole registrations to fill X seen / Y waitlisted); **single run**; **lottery-result SMS** to all consenting registrants
-- Owner self-edit via the SMS link (edit/remove always; **add only while open**)
+- Owner self-edit via the SMS link (**edit/remove until check-in/event-completion; add only while open**; GET/status always viewable — FR-22/FR-41)
 - Clinic-side: volunteer looks up by AnimalID (or name/phone), **edits** (including **adding**
   animals), prints labels; printing tags the entry **`printed`** (attendance)
 - Admin can **manually create registrations** and **assign AnimalIDs** for edge cases (walk-ins, etc.)
 - Admin data export to Excel/CSV
-- Two logins (admin + volunteer) with the **same privileges**
+- Two logins: **admin** (creates/configures/deletes events, runs the lottery, exports) and **volunteer**; clinic operations (lookup, edit, add, remove, check-in, print, manual entry, assign AnimalID) are shared by **both** roles (Decision 16)
 
 ### Out of scope (V1 — explicitly excluded)
 - Multi-tenant / multi-organization SaaS (single clinic only)
@@ -53,11 +53,13 @@ AnimalID, edits as needed, and **prints labels**.
 | Role | Who | Can do |
 |---|---|---|
 | **Owner** (public, no login) | Pet owner registering on their phone | Register (during open window), edit own entry via SMS link |
-| **Admin** | Admin | Create/configure events, run lottery, manually add entries & assign IDs, view & export data, edit any entry |
-| **Volunteer** | Clinic staff at check-in | Look up, edit (incl. add animals), print labels, export |
+| **Admin** | Admin | **Everything a volunteer can do, PLUS the Admin-only capabilities:** create/configure/delete events, run the lottery, and export data |
+| **Volunteer** | Clinic staff at check-in | **Clinic operations (shared with Admin):** look up, edit (incl. add animals), remove, check-in, print labels, manually create entries & assign AnimalIDs |
 
-> **Note:** In V1, Admin and Volunteer have the **same privileges**. The role label exists for
-> clarity/logging only.
+> **Note (privilege contract — Decision 16):** **Admin-only** capabilities are event management —
+> create / configure / delete events, run the lottery, and data export. **All clinic-day operations**
+> (look up, edit, add, remove, check-in, print, manual entry, assign AnimalID) are available to
+> **both** Admin and Volunteer. (The noon auto-lottery via cron is system-level, not a user action.)
 
 ---
 
@@ -72,17 +74,17 @@ AnimalID, edits as needed, and **prints labels**.
 - **Open window** — the period `[open_at, close_at)` during which the public form accepts new
   signups **and** owners can add animals.
 - **Close** — at `close_at` the form stops accepting new signups and owner animal-add is disabled
-  (edit/remove still allowed). Automatic.
+  (edit/remove still allowed **until check-in/event-completion**; GET/status always viewable — FR-22/41). Automatic.
 - **Registration (Entry)** — one owner's submission for an event. Contains owner info + animals.
 - **Animal** — one pet within a registration.
 - **AnimalID** — a sequential integer **starting at 1** (1, 2, 3, …, max **999**), assigned in the lottery's **shuffled** order to selected + waitlisted
-  registrations, or **manually by an admin** (next available number). One per registration
+  registrations, or **manually by staff (admin or volunteer)** (next available number; assigning an ID to a `registered`/`not_selected` row admits it → `selected`). One per registration
   (identifies the owner + all their animals). The volunteer types it at check-in to pull the
   record. Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next
   animal" on clinic day.
 - **Lottery** — **random** selection of whole registrations (people) — explicitly **not** in
   signup order, so people who had to borrow a phone aren't disadvantaged. Selection fills the X/Y
-  caps (may overshoot each by up to 6 animals). **Runs once.** IDs are then assigned sequentially.
+  caps (may overshoot each by up to **M** animals, where M = the largest animal count among eligible registrations — ≤6 for owner-submitted rows; more only if staff grew a record past 6 — see FR-13/TC-012/TC-052). **Runs once.** IDs are then assigned sequentially.
 - **Edit token** — an unguessable per-registration token in the SMS link that lets an owner edit
   their own entry without logging in.
 - **Printed** — flag + timestamp set when labels are printed for a registration; the authoritative
@@ -139,7 +141,7 @@ AnimalID, edits as needed, and **prints labels**.
 > dynamically from `event.services_offered`.
 
 ### User (admin / volunteer)
-`username`, hashed `password`, `role` (label only — same privileges in V1).
+`username`, hashed `password`, `role` (admin/volunteer). **Admin-only:** create/configure/delete events, run lottery, export; **both roles:** clinic operations (Decision 16). Provisioned with `is_staff` matching role (Admin=`True`, Volunteer=`False`).
 
 ---
 
@@ -187,9 +189,9 @@ hour. Both paths call the same single-run routine and cannot double-run. The alg
 1. **Randomly shuffle** all registrations (selection is random, not signup order).
 2. Walk the list assigning **selected** and accumulating the **animal count** (the sum of animals
    across the selected registrations — **not** the number of registrants) until it reaches **X**
-   animals seen (may overshoot by up to 6 animals).
+   animals seen (may overshoot by up to **M** animals — M = the largest eligible registration's animal count; ≤6 normally).
 3. Keep walking assigning **waitlisted** until the **animal count** reaches **Y** waitlist animals
-   (may overshoot).
+   (may overshoot by up to **M** animals).
 4. Remaining = **not_selected**.
 5. Assign **AnimalIDs sequentially from 1** (in the shuffled order) to each selected + waitlisted
    registration.
@@ -200,9 +202,11 @@ Then **SMS #2** goes to **every consenting** registrant **in the language they c
 - **Not selected:** *"You were not selected for [Event]. Thank you for registering — please try
   again next time."* (courtesy, no link)
 
-**Post-lottery (admin):** the lottery is not re-run. To handle edge cases (walk-ins, people who
-couldn't register online), the admin can **manually create registrations** (owner + animals) and
-**assign an AnimalID** (next available number) to any registration. AnimalIDs share one 1–999
+**Post-lottery (staff):** the lottery is not re-run. To handle edge cases (walk-ins, people who
+couldn't register online), **staff (admin or volunteer)** can **manually create registrations** (owner + animals) and
+**assign an AnimalID** (next available number) to any registration. **Assigning an ID to a not-yet-admitted
+row (`registered`/`not_selected`) also admits it — `status` is set to `selected` atomically with the ID** —
+so the owner sees the AnimalID on the status banner and the entry is clinic-lookup-able. AnimalIDs share one 1–999
 sequence per event (the database enforces uniqueness within the event).
 
 ### 7.5 Owner edits via SMS link
@@ -232,8 +236,9 @@ loads. Volunteer can:
 
 > **No-shows / waitlist:** there is no formal promotion in V1. If selected owners don't show, the
 > volunteer checks in waitlisted (or walk-in) owners against remaining capacity. The waitlist is
-> shown as an ordered list for reference. (Admin can also manually assign an AnimalID to
-> effectively admit someone.)
+> shown as an ordered list for reference. (Staff — admin or volunteer — can also manually assign
+> an AnimalID to a not-selected/waitlisted/walk-in registration, which **admits** it: `status` →
+> `selected`, atomically with the ID — see FR-37.)
 
 ### 7.7 Admin export
 Admin downloads all registrations for an event as **Excel/CSV** (columns: owner name, phone,
@@ -275,7 +280,7 @@ website and exposes the existing native `printLabel` channel to the page via a J
 
 ## 10. Authentication & Access
 
-- Admin + Volunteer logins, **username/password**, same privileges in V1.
+- Admin + Volunteer logins, **username/password**. **Admin-only:** create/configure/delete events, run lottery, export; **both roles:** all clinic operations (Decision 16). Admin is provisioned `is_staff=True` (Django-admin access); Volunteer `is_staff=False` (clinic views only).
 - "Weak" authentication is acceptable per the agreed scope (single clinic, trusted users).
 - Owner-facing pages (register, edit-via-token) need **no login** — secured by the unguessable
   edit token and the event's open/closed window.
@@ -312,7 +317,7 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ Waitlist promotion → none in V1; `printed` tracks attendance (Decision 3)
 - ✅ AnimalID → sequential, in shuffled order, max 999 (Decision 4)
 - ✅ Print integration → Option B, Flutter WebView shell (Decision 5)
-- ✅ Lottery → single run; admin can manually add registrations & assign AnimalIDs (Decision 6)
+- ✅ Lottery → single run; staff (admin or volunteer) can manually add registrations & assign AnimalIDs (Decision 6); assigning an ID admits a `registered`/`not_selected` row (→ `selected`)
 - ✅ Admin/volunteer UI → English-only in V1 (Decision 7)
 - ✅ Registration open/close → **timestamp-driven (`open_at`/`close_at`); no manual lock** (Decision 8)
 - ✅ Pet labels → grouped (~3/label, exact count set by print testing) (Decision 9)
@@ -328,6 +333,8 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ SMS delivery + provider-side STOP/START → at-most-once/best-effort delivery; two-dimension
   opt-out (application consent vs phone-level provider block) via a Messaging Service with Advanced
   Opt-Out (Decision 15; FR-43)
+- ✅ Admin vs volunteer privileges → **differentiated**: Admin-only = create/configure/delete events,
+  run lottery, export; both roles = all clinic operations (Decision 16; FR-30)
 
 ---
 
@@ -348,13 +355,13 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 ### Functional Requirements
 
 **Event management (admin)**
-- **FR-1** Admin can create an event with full configuration (name, description, date, location, open/close times, X, Y, services offered, languages).
+- **FR-1** **Admin** can create an event with full configuration (name, description, date, location, open/close times, X, Y, services offered, languages). (**Admin-only** — Decision 16.)
 - **FR-2** Each event has a unique sign-up URL/slug.
 - **FR-3** Admin can download the sign-up URL and a QR-code JPG.
 - **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at` (+ the `live` stage) and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` while the event is `live` (timestamp-driven, no manual lock).
 - **FR-34** After `close_at`, owners can edit/remove but **not add** animals; the admin can always add/edit regardless of state.
 - **FR-38** Per-event **applicant cap Z** (admin-configured target max registrations/owners). Once reached, **new** signups are rejected with a friendly EN/ES "registration full" message; existing owners may still add animals. **Z is a soft cap** — concurrent signups at the boundary may push the count a few over Z, which is acceptable (no hard limit).
-- **FR-39** Admin can **delete an entire event** (cascade to all its registrations/animals) from the event selector / Django admin, behind a confirmation warning.
+- **FR-39** **Admin** can **delete an entire event** (cascade to all its registrations/animals) from the event selector / Django admin, behind a confirmation warning. (**Admin-only** — Decision 16.)
 
 **Owner registration (public, no login)**
 - **FR-5** Public form accessible via the event URL/QR (during the open window).
@@ -366,15 +373,15 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-11** Confirmation screen on submit (received; SMS to follow; no guaranteed time).
 
 **Lottery**
-- **FR-12** Admin runs the lottery (single run) after close; **random** selection of whole registrations (not signup order).
-- **FR-13** The selected **animal count** targets X, the waitlist **animal count** targets Y (each may overshoot by ≤ max animals/person). Selection is by whole registrations, but X/Y are caps on the total number of **animals**, not registrants.
+- **FR-12** **Admin** runs the lottery (single run — **Admin-only**; the noon auto-run via cron is system-level per FR-40, not a user privilege) after close; **random** selection of whole registrations (not signup order).
+- **FR-13** The selected **animal count** targets X, the waitlist **animal count** targets Y (each may overshoot by ≤ **M** animals, where M = the largest animal count among the eligible registrations — ≤6 for owner-submitted rows; more only if a record was grown past 6 by staff (FR-25/36/TC-052)). Selection is by whole registrations, but X/Y are caps on the total number of **animals**, not registrants.
 - **FR-14** **AnimalID assigned sequentially from 1** (max 999), in shuffled order, to each selected + waitlisted registration; unique within the event.
 - **FR-15** Statuses set: `selected` / `waitlisted` / `not_selected`.
 - **FR-40** If the lottery has not been run manually, it **runs automatically at noon (in the event's timezone) on the calendar day after `close_at`** (single-run; cannot double-run with a manual run).
 
 **SMS (Twilio)**
 - **FR-16** Send a **signup-confirmation SMS immediately on registration** to owners who consented (FR-42), containing an edit link.
-- **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **fire-and-forget: best-effort, at-most-once, never retried** — `sent` means Twilio **accepted** the request (2xx); a synchronous 4xx (e.g. invalid number) → `failed`; a 5xx/timeout/connection-loss/crash → `unknown`. Each registrant is sent **at most once** (never twice — no double-texts); a crash can mean **zero** attempts. Not guaranteed; the edit-link status page (FR-41) is the reliable channel.
+- **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **fire-and-forget: best-effort, at-most-once, never retried** — `sent` means Twilio **accepted** the request (2xx); a synchronous 4xx (e.g. invalid number) → `failed`; a 5xx/timeout/connection-loss/no-response → `unknown` (a *caught* exception; a process crash is **not** `unknown` — it leaves `null` before the claim or `sending` after, neither resent). Each registrant is sent **at most once** (never twice — no double-texts); a crash can mean **zero** attempts. Not guaranteed; the edit-link status page (FR-41) is the reliable channel.
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** consenting registrants receive a courtesy result SMS (Decision 1).
 - **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets the **application-consent** flag `sms_opt_out` and skips SMS for that registration. This toggle is the only app-side SMS gate; it is independent of Twilio's provider-side blocklist (FR-43). The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
@@ -382,8 +389,8 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to every consenting registrant, and shown on the confirmation page to those who declined SMS; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
-- **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed); admin can always add.
-- **FR-22** Edit link valid from signup **until the registration is checked-in or the event completes**.
+- **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed **until check-in/event-completion**); admin can always add.
+- **FR-22** **Two contracts:** (a) the token-authenticated **GET/status view never expires** — it renders for as long as the event data exists, even after check-in/event-completion (FR-41); (b) owner **mutation** (edit/add/remove animals) is accepted only **until the registration is checked-in or the event completes** (add is additionally limited to the open window). After check-in/completion, GET still renders (with a "locked" notice) but POST/mutation is rejected server-side.
 - **FR-41** The edit-link page displays the owner's current result (assigned AnimalID for selected/waitlisted; "not selected" once the lottery has run; "pending" before; checked-in/printed state on clinic day) — **GET renders this even after mutation locks** (check-in / event complete); only POST/edit is blocked. So SMS is not the only status channel.
 
 **Clinic check-in (volunteer/admin)**
@@ -395,15 +402,15 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-28** Print **owner label** + **pet labels (grouping ~3 animals each; exact count set by print testing)** via the print station.
 - **FR-35** Printing labels sets `printed_at` (records the owner showed up).
 
-**Admin manual entry management**
-- **FR-36** Admin can manually create a registration (owner + animals), e.g. for walk-ins or people who couldn't register online (`created_by` = admin; the 6-animal cap is not enforced for admin/volunteer).
-- **FR-37** Admin can assign/edit an **AnimalID** (sequential, max 999) on any registration, unique within the event (including manually-created entries).
+**Manual entry & AnimalID management (both roles)**
+- **FR-36** **Staff (admin or volunteer)** can manually create a registration (owner + animals), e.g. for walk-ins or people who couldn't register online (`created_by` = staff; the 6-animal cap is not enforced for staff). A manually-created row starts as `registered`; it is **admitted** (`status` → `selected`) when an AnimalID is assigned to it (FR-37).
+- **FR-37** **Staff (admin or volunteer)** can assign/edit an **AnimalID** (sequential, max 999) on any registration, unique within the event (including manually-created entries). **Assigning an ID to a `registered`/`not_selected` registration atomically sets `status='selected'` (admitting the owner)**, so the status banner shows the AnimalID; the ID + status update are saved together, and clinic lookup + export reflect the admitted status.
 
 **Data export**
-- **FR-29** Admin downloads all registrations for an event as **Excel/CSV** with specified columns (incl. chosen language).
+- **FR-29** **Admin** downloads all registrations for an event as **Excel/CSV** with specified columns (incl. chosen language). (**Admin-only** — Decision 16.)
 
 **Authentication & access**
-- **FR-30** Admin + volunteer login (username/password), **same privileges** in V1.
+- **FR-30** Admin + volunteer login (username/password). **Admin-only** capabilities: create/configure/delete events (FR-1/FR-39), run the lottery (FR-12), and export data (FR-29). **Both roles** perform all clinic operations: look up, edit, add, remove, check-in, print, manual entry, and assign AnimalID (FR-23..FR-28, FR-35..FR-37). Provisioning: Admin → `is_staff=True` (Django-admin access); Volunteer → `is_staff=False` (clinic views only); `role` and `is_staff` are set together. Enforcement: Admin-only custom views use a `role == admin` mixin; the Django admin gates on `is_staff`. (Decision 16.)
 - **FR-31** Owner public pages require **no login** (token-secured).
 - **FR-32** HTTPS enforced; registrations not publicly listed.
 
