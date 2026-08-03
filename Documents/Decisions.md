@@ -75,13 +75,13 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 12 — Applicant cap Z (FR-38; plan R-10)
-**Decision:** Per-event **Z** (target max registrations/owners), admin-configured alongside X and Y. Once reached, new signups are rejected with a friendly EN/ES "full" message. Gates only brand-new signups — existing owners may still add animals. **Z is a soft cap**: the capacity check + insert are not serialized, so concurrent signups at the boundary may push the count a few over Z — acceptable (no lock, no hard limit).
+**Decision:** Per-event **Z** (target max registrations/owners), admin-configured alongside X and Y. Once reached, new signups are rejected with a friendly EN/ES "full" message. Gates only brand-new signups — existing owners may still add animals. **Z is a soft cap**: the capacity check + insert are not serialized, so concurrent signups at the boundary may push the count a few over Z — acceptable (no lock, no hard limit). The overshoot is bounded by the number of in-flight signups at the boundary (small for human-paced submissions), so the SMS blast is ~Z, not exactly Z.
 **Your answer:** ✅ Confirmed — per-event soft applicant cap Z.
 
 ---
 
 ## Decision 13 — Twilio budget + opt-out/consent wording (plan R-11)
-**Decision:** ✅ **Confirmed.** Per event: a signup text and a result text go to each consenting registrant (≤ Z), so the blast is bounded by Z (Decision 12). The Admin approved the budget, and the opt-out/consent approach: a **signup consent checkbox (default on)** plus **"Reply STOP to opt out"** on every SMS, honored provider-side via the inbound STOP/START webhook (FR-43). Delivery is **best-effort with retry** (not guaranteed — phones off, carrier blocks). Exact compliance copy ("Msg & data rates may apply", final checkbox label) is polished during build/UX review.
+**Decision:** ✅ **Confirmed.** Per event: a signup text and a result text go to each consenting registrant; the blast is **~Z** (Z plus a small concurrency overshoot per Decision 12 — not a hard ≤Z). The Admin approved the budget, and the opt-out/consent approach: a **signup consent checkbox (default on)** plus **"Reply STOP to opt out"** on every SMS, honored provider-side via the inbound STOP/START webhook (FR-43). Delivery is **at-most-once and best-effort** (not guaranteed — phones off, carrier blocks). Exact compliance copy ("Msg & data rates may apply", final checkbox label) is polished during build/UX review.
 **Your answer:** ✅ Confirmed — budget OK; consent checkbox + STOP opt-out; best-effort delivery.
 
 ---
@@ -93,7 +93,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 15 — SMS delivery + provider-side STOP/START (FR-43)
-**Decision:** SMS delivery is **best-effort with retry** (a delivery state tracks sending/sent/failed/unknown; failures are retried, never double-sent) — not guaranteed. "Reply STOP to opt out" is made real provider-side: an **inbound STOP/START webhook** (Twilio Advanced Opt-Out) syncs `sms_opt_out`; outbound treats a Twilio `21610` block as a durable opt-out, and re-consent requires START (the website toggle can't override a provider block).
+**Decision:** SMS delivery is **at-most-once and best-effort** (a delivery state tracks each send; only transient failures are retried — never a `sent` or an ambiguous `unknown`, so no double-texts) — not guaranteed, backstopped by the edit-link status page (FR-41). "Reply STOP to opt out" is made real provider-side: a **signature-validated inbound STOP/START webhook** (Twilio Advanced Opt-Out) syncs `sms_opt_out` phone-level; outbound treats a Twilio `21610` block as a durable opt-out, and re-consent requires START (the website toggle can't override a provider block).
 **Your answer:** ✅ Confirmed — best-effort delivery + STOP/START webhook (FR-43).
 
 ---

@@ -17,7 +17,7 @@ clinic a volunteer enters the AnimalID, edits as needed, and **prints labels**.
 
 This is a **greenfield Django app** in `/home/dev/cwac` (today: only `Documents/`
 and `communications/`, no code, no git). Full spec lives in `Documents/` (Requirements,
-Architecture, Decisions, TraceabilityMatrix). **42 FRs (FR-1..FR-42) + 4 NFRs.**
+Architecture, Decisions, TraceabilityMatrix). **43 FRs (FR-1..FR-43) + 4 NFRs.**
 
 ### Locked scoping (confirmed with user)
 - **Backend-first.** This plan delivers the complete Django backend + a print-payload endpoint with
@@ -104,7 +104,7 @@ migration is made.
 - `edit_token` CharField(unique, db_index, default=`token_urlsafe(32)`) — 256-bit, only auth for self-edit
 - `language` CharField(2, choices en/es, default en) — **chosen at signup, drives SMS**
 - `printed_at`, `checked_in_at` DateTimeField(null, blank)
-- `result_sms_state` CharField(null/sending/sent/failed/unknown, default null) + `result_sms_sent_at` DateTimeField(null, blank, set only on confirmed `sent`) — delivery tracking for the lottery-result SMS: atomically claim null→`sending`, send, then mark `sent` on confirmed success (else `failed`/`unknown`); retried, never double-sent (R-4; TC-057)
+- `result_sms_state` CharField(null/sending/sent/failed/unknown, default null) + `result_sms_sent_at` DateTimeField(null, blank, set only when state=`sent`) — **at-most-once** delivery tracking for the lottery-result SMS: claim null→`sending`, then `sent` on Twilio 201, `failed` (transient 5xx/conn = retryable; or permanent 4xx/`21610`), or `unknown` (timeout = not retried). Only transient `failed` is retried; `sent`/`unknown` are never re-sent (R-4; TC-057)
 - `sms_opt_out` BooleanField(default=False) — owner declined SMS (set by the signup consent checkbox, FR-42); when True, signup + result SMS are skipped and status is shown on the edit-link page (FR-41)
 - `first_name`, `last_name` CharField(100); `phone` CharField(20) E.164; `email` EmailField; `address` CharField(300) — **all required**
 - `created_by` choices self/admin (default self); `created_at`, `updated_at`
@@ -192,21 +192,28 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
 - **#2 result** (after lottery, to **every consenting** registrant — FR-17/19, TC-017/018/019):
   selected → "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]";
   not_selected → courtesy text, **no link**.
-- Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (everyone)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
-- Delivery is **best-effort with retry**, tracked by `result_sms_state`: atomically claim
+- Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (every consenting registrant)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
+- Delivery is **at-most-once and best-effort**, tracked by `result_sms_state`: atomically claim
   `null→sending` (`Registration.objects.filter(pk=reg.pk, result_sms_state__isnull=True).update(result_sms_state='sending')`
-  — only the claimant sends), call Twilio, then set `sent` + `result_sms_sent_at` on confirmed
-  success, `failed` on a known error, or `unknown` on timeout. A retry sweep re-attempts
-  `failed`/`unknown` (and stale `sending`); a `sent` row is never re-sent, so manual + cron + retry
-  never double-text (Architecture §12; TC-050/057). Delivery is **not guaranteed** (phones off,
-  carrier blocks) — FR-17/19 are best-effort. **Skips any registrant with `sms_opt_out=True`**
-  (FR-42). Per-reg try/except + logging so one Twilio failure doesn't abort the batch, and sends
-  are **concurrent** (small thread pool) so up to ~Z result texts finish well within a request/cron
-  window.
+  — only the claimant sends), call Twilio, then: **HTTP 201** → `sent` + `result_sms_sent_at` (Twilio
+  queued it); **4xx** (invalid number / `21610` blocked) → `failed` (permanent — for `21610` also opt
+  out every registration sharing that phone); **5xx / connection error** → `failed` (transient —
+  retryable); **timeout** → `unknown`. A `retry_sms` sweep (`manage.py retry_sms`, Render Cron Job
+  ~every 5 min) re-attempts only **transient `failed`** rows older than a threshold, each behind an
+  atomic re-claim and capped at N attempts. `sent` and `unknown` are **never** re-sent — `unknown`
+  means Twilio may already have queued the message, so retrying could duplicate it; it is flagged
+  for review instead. So the app makes **at most one** send it believes succeeded per registration
+  (no double-texts); delivery itself is **not guaranteed** (phones off, carrier blocks) — FR-17/19
+  are best-effort, backstopped by the edit-link status page (FR-41). **Skips any registrant with
+  `sms_opt_out=True`** (FR-42). Per-reg try/except + logging; sends are **concurrent** (small pool).
 - **STOP/START opt-out sync (FR-43):** an inbound-SMS webhook (`/sms/inbound/`, Twilio Advanced
-  Opt-Out) mirrors STOP→`sms_opt_out=True` and START→`sms_opt_out=False`. Outbound treats a Twilio
-  `21610` (blocked) as a durable opt-out (set + log). The website toggle (FR-42) and the provider
-  blocklist reconcile on each send — a provider block wins; re-consent requires START (TC-055/056).
+  Opt-Out) mirrors STOP→`sms_opt_out=True` and START→`sms_opt_out=False` for **every registration
+  whose normalized phone matches the inbound `From`** — consent is effectively phone-level, matching
+  Twilio's per-number blocklist (R-2 allows duplicate phones, so a STOP must cover all of them). The
+  endpoint is **CSRF-exempt and authenticated by `twilio.request_validator.RequestValidator` against
+  the `X-Twilio-Signature` header** — forged/unsigned POSTs are rejected (TC-058). Outbound treats a
+  Twilio `21610` (blocked) as a durable, phone-level opt-out. The website toggle (FR-42) can't
+  override a provider block — re-consent requires START (TC-055/056/059).
 
 ### i18n
 Public form markup uses `{% trans %}`; `makemessages -l es` → translate → `compilemessages`. EN/ES
@@ -259,12 +266,12 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z soft applicant cap → friendly full message; slight overshoot ok)**; `OwnerForm` (+ `sms_consent` checkbox, default on) + dynamic `AnimalFormSet(min_num=1, max_num=6)`; confirmation screen (no guaranteed time; shows the edit link even if SMS was declined); persist language; fire SMS #1 to consenters | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33/38/42; TC-004/005/006/007/008/010/011/016/037/046/047/051/054 |
 | **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); edit/remove always; **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
 | **5 Lottery** | `run_lottery` service (Event-row lock + post-lock guard) + exceptions; admin "Run lottery" action; `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4/FR-40) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15/40; TC-012/013/014/015/049/050 |
-| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting** registrant in stored language (`result_sms_state` delivery tracking, skips `sms_opt_out`); **inbound STOP/START webhook handler** (FR-43); wired after lottery run | `sms/templates.py`, `sms/views.py` (webhook), `lottery/services.py` | FR-17/18/19/43; TC-017/018/019/055/056/057 |
+| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting** registrant in stored language (at-most-once `result_sms_state` delivery, skips `sms_opt_out`); **inbound STOP/START webhook** (signature-validated; FR-43); **`retry_sms` command** (bounded retry of transient failures); wired after lottery run | `sms/templates.py`, `sms/views.py` (webhook), `sms/management/commands/retry_sms.py`, `lottery/services.py` | FR-17/18/19/43; TC-017/018/019/055/056/057/058/059 |
 | **7 Clinic check-in + lookup** | `LoginRequiredMixin` views: `select_event` (session), `lookup` (AnimalID exact / fuzzy name+phone, **event-scoped**), `detail` (editable, `max_num=None`), add/remove/save, `check_in`; ordered waitlist list (no promotion) | `clinic/{views,urls}.py`, `templates/clinic/*` | FR-23/24/25/26/27; TC-025/026/027/028/029/030/034/036 |
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
 | **9 Export** | CSV streaming + XLSX builders | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
 | **10 Admin manual entry + AnimalID** | Admin create Registration (`created_by=admin`, no cap); "next available" AnimalID button; `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); configure **Twilio inbound webhook** for STOP/START (FR-43) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32; TC-038/039 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **Cron Job** running `manage.py retry_sms` ~every 5 min (FR-17); configure **Twilio inbound webhook** (STOP/START, signature-validated; FR-43) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -297,6 +304,10 @@ TC-056 (START re-consent + 21610), TC-057 (provider-failure retry). E2E/manual: 
   index** of registrations — no list view, no enumeration (FR-32).
 - CSRF on all POSTs (Django default); prod `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`,
   `CSRF_COOKIE_SECURE`; secrets only in env.
+- **The Twilio webhook (`/sms/inbound/`) is the one public POST exempt from CSRF** (Twilio can't
+  send a CSRF token); it is authenticated instead with
+  `twilio.request_validator.RequestValidator` against the `X-Twilio-Signature` header —
+  forged/unsigned requests are rejected (FR-43; TC-058).
 
 ---
 
@@ -321,7 +332,9 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   uniqueness. Each Registration has a unique PK (`registrantID`) + `animal_id` + `edit_token`; the
   edit URL carries the token. Two people with identical name/phone/pet simply create two rows —
   nothing breaks. Clinic lookup by name/phone may return multiple matches; narrowing by RegistrantID
-  or AnimalID resolves it. (Acceptable per review.)
+  or AnimalID resolves it. (Acceptable per review.) **SMS consent/opt-out is phone-level (FR-43):**
+  a STOP or a Twilio `21610` block applies to every registration sharing that number, so duplicate-
+  phone rows never hold contradictory consent.
 - **R-3 Status-display drift — ELIMINATED by design.** The `status` column stores only discrete
   admin-driven stages; the **displayed** open/closed label is computed live from
   `open_at`/`close_at`/`lottery_run_at`. So the admin always sees reality — no drift, no cron needed.
@@ -332,8 +345,9 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   **locks the Event row inside the transaction and re-checks `lottery_run_at` after the lock**, so a
   concurrent manual click and cron run cannot double-run (TC-050). Auto path = `run_due_lotteries`
   command on a Render Cron Job (hourly) + an admin "overdue lottery" warning/one-click-run banner as
-  a no-cron fallback. Result SMS is tracked by a delivery state (`result_sms_state`) — best-effort with retry, never
-  double-sent — and sent concurrently so ~Z texts finish quickly.
+  a no-cron fallback. Result SMS is **at-most-once** (a `result_sms_state` tracks each send; only transient failures are
+  retried — never `sent`/`unknown` — so no double-texts), best-effort (not guaranteed), and sent
+  concurrently so ~Z texts finish quickly.
 - **R-5 Check-in concurrency — RESOLVED by design (verify at first busy event).** One volunteer/printer is the norm; two+ volunteers with
   two printers also work cleanly — that's exactly why Postgres (not SQLite). Duplicate AnimalIDs are
   blocked by the unique index; two volunteers editing the same registration is last-write-wins and
@@ -357,11 +371,12 @@ above other middleware; no writable disk at runtime → collectstatic at build.
   the capacity check + insert are not serialized, so concurrent signups at the boundary may push the
   count a few over Z — acceptable (no lock needed).** Gates only brand-new registrations (existing
   owners may still add animals).
-- **R-11 Twilio cost/consent — RESOLVED.** 2 SMS/registrant × up to Z/event; budget approved by
-  the Admin. Consent = signup checkbox (default on) + "Reply STOP to opt out" on every SMS,
-  honored provider-side via the inbound STOP/START webhook (FR-42/FR-43). The Z cap (R-10) bounds
-  the blast; exact compliance copy polished at build time. Delivery is best-effort with retry
-  (R-4 delivery state), not guaranteed.
+- **R-11 Twilio cost/consent — RESOLVED.** ≈2 SMS/consenting-registrant × ~Z/event (Z is a soft
+  cap; the final count is Z plus a small concurrency overshoot from in-flight signups) — budget
+  approved by the Admin. Consent = signup checkbox (default on) + "Reply STOP to opt out" on every
+  SMS, honored provider-side via the inbound STOP/START webhook (FR-42/FR-43). The Z cap (R-10)
+  bounds the blast; exact compliance copy polished at build time. Delivery is at-most-once and
+  best-effort (R-4 delivery state), not guaranteed.
 
 ---
 

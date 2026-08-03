@@ -367,11 +367,11 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 
 **SMS (Twilio)**
 - **FR-16** Send a **signup-confirmation SMS immediately on registration** to owners who consented (FR-42), containing an edit link.
-- **FR-17** After the lottery, send a **best-effort result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. (Delivery is best-effort with retry, not guaranteed.)
+- **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **at-most-once and best-effort** — each registrant gets at most one send the app believes succeeded (no double-texts); not guaranteed, backstopped by the edit-link status page (FR-41).
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** consenting registrants receive a courtesy result SMS (Decision 1).
 - **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
-- **FR-43** **STOP/START opt-out sync.** Twilio STOP/START keywords (received via an inbound-SMS webhook) update `sms_opt_out` (STOP → opted out; START → re-consented). Outbound skips opted-out numbers and treats a Twilio block (error 21610) as a durable opt-out; the website toggle cannot override a provider block — re-consent requires START.
+- **FR-43** **STOP/START opt-out sync.** Twilio STOP/START keywords received via an inbound-SMS webhook — **authenticated by Twilio's `X-Twilio-Signature`** (the one public POST exempt from CSRF) — update `sms_opt_out` (STOP → opted out; START → re-consented) for **every registration matching that phone number**. Outbound skips opted-out numbers and treats a Twilio block (error 21610) as a durable, phone-level opt-out; the website toggle cannot override a provider block — re-consent requires START.
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to every consenting registrant, and shown on the confirmation page to those who declined SMS; in the lottery-result SMS only to selected/waitlisted — never to not-selected).

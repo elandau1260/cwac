@@ -88,7 +88,7 @@ existing Flutter/Android app reused solely as the label-print station.
 | `events` | Create/configure events; `open_at`/`close_at` window (auto close, no manual lock); per-event applicant cap Z; unique slug; QR/URL download; delete entire event; back-office via Django admin | FR-1..FR-4, FR-34, FR-38, FR-39 |
 | `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; SMS-consent checkbox (default on); stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close); edit-link shows lottery result; SMS opt-out toggle | FR-5..FR-11, FR-20..FR-22, FR-33, FR-41, FR-42 |
 | `lottery` | Random shuffle + select whole registrations to X/Y caps; assign sequential AnimalIDs; set statuses; single-run guard (manual click + noon auto-run) | FR-12..FR-15, FR-40 |
-| `sms` | Send signup-confirmation + best-effort lottery-result SMS via Twilio in the registration's stored language; delivery-state tracking + retry; inbound STOP/START opt-out webhook | FR-16..FR-19, FR-42, FR-43 |
+| `sms` | Send signup-confirmation + at-most-once/best-effort lottery-result SMS via Twilio in the registration's stored language; delivery-state tracking + `retry_sms`; signature-validated inbound STOP/START opt-out webhook | FR-16..FR-19, FR-42, FR-43 |
 | `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; admin manual entry create + AnimalID assignment | FR-23..FR-28, FR-35..FR-37 |
 | `printing` | Serve label payload (owner + grouped pet labels) to the print station | FR-28, NFR-4 |
 | `export` | CSV/XLSX export with the agreed columns | FR-29 |
@@ -248,6 +248,8 @@ second UI.)
   state (FR-20, FR-21, FR-22). Tokens are scoped to one registration.
 - HTTPS everywhere (NFR-2); no public listing of registrations (FR-32).
 - Twilio credentials and `SECRET_KEY` come from environment variables, never the repo (NFR-3).
+- The Twilio inbound webhook (`/sms/inbound/`) is the one CSRF-exempt public POST, authenticated by
+  `X-Twilio-Signature` (`RequestValidator`) — forged requests are rejected (FR-43).
 - V1 accepts "weak" auth by design (single clinic, trusted users).
 
 ---
@@ -291,7 +293,7 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
-15. ✅ SMS delivery + provider opt-out → best-effort delivery with retry (delivery state); inbound STOP/START webhook syncs `sms_opt_out` (FR-43).
+15. ✅ SMS delivery + provider opt-out → at-most-once/best-effort delivery (delivery state; only transient failures retried); signature-validated inbound STOP/START webhook syncs `sms_opt_out` phone-level (FR-43).
 
 **Residual verification risks (not open decisions):**
 - Check-in concurrency — resolved by design (Postgres + the unique AnimalID index); verify under
