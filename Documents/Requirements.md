@@ -57,8 +57,7 @@ AnimalID, edits as needed, and **prints labels**.
 | **Volunteer** | Clinic staff at check-in | Look up, edit (incl. add animals), print labels, export |
 
 > **Note:** In V1, Admin and Volunteer have the **same privileges**. The role label exists for
-> clarity/logging only. (Reverses the Admin's "no edit" idea from the email — editing at the clinic
-> is required for real-world cases like "registered 4, showed with 1".)
+> clarity/logging only.
 
 ---
 
@@ -68,7 +67,7 @@ AnimalID, edits as needed, and **prints labels**.
   `draft → live → lottery_run → active → completed`. Separately, whether the form is **open** or
   **closed** for new signups is a **computed, read-time label** derived from `open_at`/
   `close_at`/`lottery_run_at` (R-3) — it is **never stored**. The form accepts new signups only
-  during `[open_at, close_at)` and before the lottery runs; running the lottery, activation, and
+  during `[open_at, close_at)`; running the lottery, activation, and
   completion are admin actions (timestamp-driven, **no manual lock** — Decision 8).
 - **Open window** — the period `[open_at, close_at)` during which the public form accepts new
   signups **and** owners can add animals.
@@ -117,12 +116,12 @@ AnimalID, edits as needed, and **prints labels**.
 | `edit_token` | For the SMS edit link (created at signup) |
 | `language` | **EN/ES the owner chose at signup — drives the SMS language** |
 | `printed_at` | Set when labels print = owner showed up (nullable) |
-| `sms_opt_out` | Boolean (default **false**) — **application-level consent only** (per-registration). Set by the signup consent checkbox or the edit-link toggle (FR-42). A *separate* phone-level provider block (`sms.PhoneBlock`) captures STOP/START/`21610` (FR-43); a send requires **both** this flag false **and** no provider block. When either blocks it, no SMS is sent — the owner tracks status via the edit link (FR-41) |
+| `sms_opt_out` | Boolean (default **false**) — **application-level consent only** (per-registration). Set by the signup consent checkbox or the edit-link toggle (FR-42). A *separate* phone-level provider block (`sms.PhoneBlock`, written only by inbound STOP/START) is the other dimension (FR-43); a send requires **both** this flag false **and** no provider block. When either blocks it, no SMS is sent — the owner tracks status via the edit link (FR-41) |
 | `result_sms_state` / `result_sms_sent_at` | Denormalized rollup of the registration's `sms.SmsAttempt`s ("did this reg get its result SMS?") — `null`/`sending`/`sent`/`failed_permanent`/`unknown`; `sent_at` set on success (FR-17). |
 
 **SMS delivery models (`sms` app):**
-- `sms.PhoneBlock(phone, blocked_at, reason)` — phone-level provider block (STOP/START/`21610`); one row = blocked. Twilio-only (FR-43).
-- `sms.SmsAttempt(registration FK, callback_token, message_sid, state, provider_status, reconciled, created_at)` — one row per Twilio send try. `callback_token` is embedded in the per-message `StatusCallback` URL so a callback reconciles the attempt even when no response/SID was captured; `provider_status` advances monotonically (terminal states sticky). State: `sending`/`sent`/`failed_permanent`/`unknown` (5xx→`unknown`; nothing is auto-retried on a timer). Attempt count/cap are derived from these rows.
+- `sms.PhoneBlock(phone, blocked_at, reason)` — phone-level provider block; one row = blocked. **Written only by the inbound STOP/START webhook** (never by a send/callback); a `21610` is a send failure, not a block. Twilio-only (FR-43).
+- `sms.SmsAttempt(registration FK, purpose, callback_token, message_sid, is_initial, retry_of, retry_claimed_at, state, provider_status, provider_error_code, retryable, reconciled, created_at)` — one row per Twilio send try. `purpose` ∈ signup/result (rollup + retry scoped to result). Atomic initial claim via unique `(registration, purpose) WHERE is_initial`; one-consumer retry via unique `retry_of` + `retry_claimed_at`. `callback_token` is embedded in the per-message `StatusCallback` URL so a callback reconciles the attempt even with no captured SID; `provider_status` advances monotonically (terminal sticky); `provider_error_code`/`retryable` persist the callback's failure classification. State: `sending`/`sent`/`failed_permanent`/`unknown` (5xx→`unknown`; nothing auto-retried on a timer).
 | **Owner fields (all required)** | first name, last name, phone, email, address |
 | `created_at`, `updated_at`, `created_by` | owner (self) vs admin/volunteer |
 
@@ -190,9 +189,11 @@ run by **noon (in the event's timezone) on the calendar day after `close_at`**, 
 **automatically** (FR-40) so it can't be forgotten and result texts still go out at a civilized
 hour. Both paths call the same single-run routine and cannot double-run. The algorithm:
 1. **Randomly shuffle** all registrations (selection is random, not signup order).
-2. Walk the list assigning **selected** and accumulating animal counts until the selected total
-   reaches **X** (may overshoot by up to 6).
-3. Keep walking assigning **waitlisted** until that total reaches **Y** (may overshoot).
+2. Walk the list assigning **selected** and accumulating the **animal count** (the sum of animals
+   across the selected registrations — **not** the number of registrants) until it reaches **X**
+   animals seen (may overshoot by up to 6 animals).
+3. Keep walking assigning **waitlisted** until the **animal count** reaches **Y** waitlist animals
+   (may overshoot).
 4. Remaining = **not_selected**.
 5. Assign **AnimalIDs sequentially from 1** (in the shuffled order) to each selected + waitlisted
    registration.
@@ -352,7 +353,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-1** Admin can create an event with full configuration (name, description, date, location, open/close times, X, Y, services offered, languages).
 - **FR-2** Each event has a unique sign-up URL/slug.
 - **FR-3** Admin can download the sign-up URL and a QR-code JPG.
-- **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at`/`lottery_run_at` and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` and before the lottery runs (timestamp-driven, no manual lock).
+- **FR-4** Event stored lifecycle (`draft → live → lottery_run → active → completed`); the **open↔closed** label is computed from `open_at`/`close_at`/`lottery_run_at` and never stored (R-3). The form accepts new signups only during `[open_at, close_at)` (timestamp-driven, no manual lock).
 - **FR-34** After `close_at`, owners can edit/remove but **not add** animals; the admin can always add/edit regardless of state.
 - **FR-38** Per-event **applicant cap Z** (admin-configured target max registrations/owners). Once reached, **new** signups are rejected with a friendly EN/ES "registration full" message; existing owners may still add animals. **Z is a soft cap** — concurrent signups at the boundary may push the count a few over Z, which is acceptable (no hard limit).
 - **FR-39** Admin can **delete an entire event** (cascade to all its registrations/animals) from the event selector / Django admin, behind a confirmation warning.
@@ -368,7 +369,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 
 **Lottery**
 - **FR-12** Admin runs the lottery (single run) after close; **random** selection of whole registrations (not signup order).
-- **FR-13** Selected count targets X, waitlist targets Y (each may overshoot by ≤ max animals/person).
+- **FR-13** The selected **animal count** targets X, the waitlist **animal count** targets Y (each may overshoot by ≤ max animals/person). Selection is by whole registrations, but X/Y are caps on the total number of **animals**, not registrants.
 - **FR-14** **AnimalID assigned sequentially from 1** (max 999), in shuffled order, to each selected + waitlisted registration; unique within the event.
 - **FR-15** Statuses set: `selected` / `waitlisted` / `not_selected`.
 - **FR-40** If the lottery has not been run manually, it **runs automatically at noon (in the event's timezone) on the calendar day after `close_at`** (single-run; cannot double-run with a manual run).
@@ -381,7 +382,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets the **application-consent** flag `sms_opt_out` and skips SMS for that registration. This toggle is **application-level only** — it cannot clear a phone-level provider block (FR-43). The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
 - **FR-43** **Provider-side opt-out + delivery reconciliation — two independent dimensions.** Application consent (`sms_opt_out`, FR-42) is **per-registration and owner-controlled**. The **provider block** is a **separate, phone-level** record (`sms.PhoneBlock`) written **only** by Twilio, never by the website toggle. A send requires **both** clear. Concretely:
   - **STOP/START/HELP** arrive via an inbound-SMS webhook on the **Messaging Service** (Twilio Advanced Opt-Out, which posts `OptOutType` — the three documented values are uppercase **`STOP`** / **`START`** / **`HELP`**; the handler normalizes to uppercase), **authenticated by `X-Twilio-Signature`** (`RequestValidator`) — one of the two public POSTs exempt from CSRF. `STOP` upserts a `PhoneBlock` for the normalized `From`; `START` deletes it; `HELP` is a no-op (Twilio replies with its help text). The webhook writes **only** the provider block — **`START` never grants application consent**, so a registration the owner explicitly declined stays opted out.
-  - A per-message **delivery-status callback** (`/sms/status/<callback_token>/`, the second signature-validated webhook) carries each attempt's opaque token in the URL, so it reconciles the matching `SmsAttempt` **even when no response/SID was captured** (the `unknown` case) and even if it arrives before the send handler finished. It advances `provider_status` **monotonically** (terminal states sticky; callbacks can arrive out of order), and a `21610` it carries upserts a `PhoneBlock`. `21610` is **not** assumed synchronous (Twilio's docs don't guarantee the mechanism), so it is a best-effort secondary signal; the inbound STOP/START webhook is the authoritative opt-out source.
+  - A per-message **delivery-status callback** (`/sms/status/<callback_token>/`, the second signature-validated webhook) carries each attempt's opaque token in the URL, so it reconciles the matching `SmsAttempt` **even when no response/SID was captured** (the `unknown` case) and even if it arrives before the send handler finished. It advances `provider_status` **monotonically** (terminal states sticky; callbacks can arrive out of order) and records `provider_error_code`/`retryable`. **It does not write `PhoneBlock`** — a `21610` it carries only marks the attempt `failed_permanent` and logs (the block, if any, came from the authoritative STOP webhook). `21610` is **not** assumed synchronous, so it is a best-effort secondary signal; the inbound STOP/START webhook is the sole, authoritative opt-out writer.
   - Because the block is keyed by phone, it covers every registration sharing that number (R-2) and any created after the STOP. Re-consent of a blocked number requires START (the website toggle cannot override a provider block).
 
 **Owner edit (token)**

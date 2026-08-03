@@ -132,30 +132,44 @@ migration is made.
 ### `sms.PhoneBlock` (provider-side, phone-level opt-out)
 - `phone` CharField(E.164, unique, db_index) — the **normalized** number (the inbound `From`, or the `To` of a send that returned `21610`)
 - `blocked_at` DateTimeField(auto_now_add=True); `reason` CharField(choices: `stop` / `21610`)
-- **One row = the number is blocked.** A `Registration` is eligible for SMS only when `not sms_opt_out` **and** no `PhoneBlock` exists for its normalized `phone` — **both** dimensions must be clear. STOP/START/`21610` write **only** this model, never `sms_opt_out` (FR-43). START deletes the row; it does **not** change application consent, so a registration the owner explicitly declined stays opted out (TC-060). Keyed by phone (not registration), the block covers every registration sharing that number (R-2 duplicate phones) and any registration created after the STOP (TC-061).
+- **One row = the number is blocked.** A `Registration` is eligible for SMS only when `not sms_opt_out` **and** no `PhoneBlock` exists for its normalized `phone` — **both** dimensions must be clear. **Only the inbound STOP/START webhook writes this model** (never `sms_opt_out`, and never a delivery callback — a `21610` is a send failure, not a block write; FR-43). START deletes the row; it does **not** change application consent, so a registration the owner explicitly declined stays opted out (TC-060). Keyed by phone (not registration), the block covers every registration sharing that number (R-2 duplicate phones) and any registration created after the STOP (TC-061).
 
 ### `sms.SmsAttempt` (one send try; Registration 1──* SmsAttempt)
 The unit of a single Twilio send and the basis for **sound at-most-once** delivery + reconciliation.
-- `registration` FK(Registration, related_name=sms_attempts, CASCADE); `callback_token`
-  SlugField(unique, db_index, default=`uuid4`/`token_urlsafe`) — an opaque token embedded in the
-  **per-message** `StatusCallback` URL so a later callback can identify **this attempt** even when
-  no response / Message SID was captured (the `unknown` case); `message_sid` CharField(null) — the
-  Twilio Message SID, set on a 2xx response **or** on the matching callback.
+- `registration` FK(Registration, related_name=sms_attempts, CASCADE); `purpose`
+  CharField(choices: `signup` / `result`) — which message this attempt delivers. The rollup
+  (`Registration.result_sms_state`) and the retry cap/sweep are scoped to `purpose='result'`; a
+  signup attempt is a single best-effort send (not retried — the owner has the edit link on the
+  confirmation page). `callback_token` SlugField(unique, db_index,
+  default=`uuid4`/`token_urlsafe`) — an opaque token embedded in the **per-message** `StatusCallback`
+  URL so a later callback can identify **this attempt** even when no response/SID was captured;
+  `message_sid` CharField(null) — the Twilio Message SID, set on a 2xx response **or** the matching callback.
+- **Atomic initial claim** — `is_initial` BooleanField(default=True), with
+  `UniqueConstraint(fields=[registration, purpose], condition=Q(is_initial=True))`: the initial send
+  is an atomic INSERT; a second worker that races (e.g. two notification workers) hits an
+  `IntegrityError` and skips (TC-070). **One-consumer retry claim** — `retry_of` FK(self, null,
+  related_name=retries) pointing at the reconciled-failed attempt being retried, with
+  `UniqueConstraint(fields=[retry_of], condition=Q(retry_of__isnull=False))` (a source has at most
+  one retry) plus `retry_claimed_at` DateTimeField(null); `retry_sms` atomically sets
+  `retry_claimed_at` (`filter(pk=source.pk, retry_claimed_at__isnull=True).update(retry_claimed_at=now())`)
+  before creating the child attempt — only the claimant proceeds (TC-071).
 - `state` choices: `sending` / `sent` / `failed_permanent` / `unknown`. **No `failed_transient`** —
   classification is by what is **proven** (RFC 9110 §9.2.2: a non-idempotent POST's response does
-  **not** prove no side effect): `sent` on a definitive acceptance (2xx + SID);
-  `failed_permanent` on a 4xx that Twilio documents as a **pre-acceptance** rejection (invalid
-  number/body — the request was rejected before a message was created; for `21610` also upsert
-  `PhoneBlock`); `unknown` on **5xx / connection error / timeout / no response / crashed worker**
-  (a 5xx is a server error — it does **not** prove the message was not created).
-- `provider_status` choices: null / `queued` / `sent` / `delivered` / `undelivered` / `failed` —
-  written **only** by the delivery-status callback, with **monotonic precedence**: terminal states
-  (`delivered`/`undelivered`/`failed`) are sticky — a later `queued`/`sent` cannot overwrite them
-  (callbacks can arrive out of order). `reconciled` BooleanField(default=False) — set True once a
-  callback reports a terminal provider status.
-- `created_at` (this attempt's timestamp). Attempt count / cap / age are **derived from the set of
-  `SmsAttempt` rows**, not from `updated_at` (which owner edits change) — so selection survives a
-  command restart.
+  **not** prove no side effect): `sent` on a definitive acceptance (2xx + SID); `failed_permanent`
+  on a 4xx that Twilio documents as a **pre-acceptance** rejection (invalid number/body) **or** a
+  `21610` (blocked) — the message will not deliver, so it is terminal (it is **not** retried); an
+  `unknown` on **5xx / connection error / timeout / no response / crashed worker** (a 5xx is a
+  server error — it does **not** prove the message was not created).
+- `provider_status` choices: null / `queued` / `sent` / `delivered` / `undelivered` / `failed`
+  (written **only** by the delivery-status callback, **monotonic** — terminal states are sticky, so
+  out-of-order callbacks cannot clobber them); `provider_error_code` CharField(null) — the Twilio
+  `ErrorCode` from the callback; `retryable` BooleanField(null) — the persisted classification used
+  by `retry_sms`: a terminal callback with a **non-permanent** code (`undelivered`/`failed` that is
+  not `21610`/invalid-number) → `retryable=True`; a permanent code (`21610`, 21211 invalid number,
+  …) → `retryable=False`. Persisted so selection survives a restart (TC-062/072). `reconciled`
+  BooleanField(default=False) — set True once a callback reports a terminal provider status.
+- `created_at`. The per-(registration,purpose) attempt count/cap are **derived from the set of
+  `SmsAttempt` rows**, not from `updated_at` (which owner edits change).
 
 ---
 
@@ -226,35 +240,39 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
 - **#2 result** (after lottery, to **every consenting** registrant — FR-17/19, TC-017/018/019):
   selected → "You're in! AnimalID is 7. [link]"; waitlisted → "Waitlist. AnimalID 7. [link]";
   not_selected → courtesy text, **no link**.
-- Edit link: `request.build_absolute_uri(reverse('register:edit', args=[slug, token]))` — in **SMS #1 (every consenting registrant)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018).
-- Delivery is **at-most-once and best-effort**, tracked per attempt on `sms.SmsAttempt` (rolled up
-  to `Registration.result_sms_state`). A send is gated on **two independent dimensions**: `not
-  reg.sms_opt_out` (application consent) **and** no `sms.PhoneBlock` for the normalized `reg.phone`.
-  Per attempt: create a `SmsAttempt(state='sending', callback_token=<new>)`, then POST to Twilio
-  (Messaging Service) with a **per-message `StatusCallback`** of
-  `<site>/sms/status/<callback_token>/` — supported under a Messaging Service (it overrides the
-  service-level callback) and carries the token so the callback can identify **this attempt** even
-  when no response/SID was captured. Classify the response by what is **proven** (RFC 9110 §9.2.2:
-  a non-idempotent POST's response does **not** prove no side effect):
-  - **HTTP 2xx + Message SID** → `state='sent'`, `message_sid=SID`; roll `Registration.result_sms_state='sent'`.
-    Accepted ≠ delivered (delivery stays best-effort); the callback below may later confirm/deny it.
-  - **4xx documented as pre-acceptance** (invalid number/body — rejected before a message was
-    created), or a synchronous `21610` (blocked) → `state='failed_permanent'` (+ upsert `PhoneBlock`
-    for `21610`). Not retried (it would fail identically).
+- Edit link: `absolute_url(reverse('register:edit', args=[slug, token]))` — a helper built from the
+  `PUBLIC_BASE_URL` setting (see Deployment) so links are correct from a request context **and** from
+  cron/retry commands. In **SMS #1 (every consenting registrant)** and **SMS #2 only for selected/waitlisted**; the not-selected courtesy text has no link (FR-17/FR-20, TC-018/074).
+- Delivery is **at-most-once and best-effort**, tracked per attempt on `sms.SmsAttempt` (the
+  `purpose='result'` attempts roll up to `Registration.result_sms_state`). A send is gated on **two
+  independent dimensions**: `not reg.sms_opt_out` (application consent) **and** no `sms.PhoneBlock`
+  for the normalized `reg.phone`. **Initial send** = an atomic INSERT of an `is_initial=True`
+  `SmsAttempt(purpose=…, state='sending', callback_token=<new>)`; the unique `(registration, purpose)
+  WHERE is_initial` constraint means a racing second worker gets an `IntegrityError` and skips
+  (TC-070). POST to Twilio (Messaging Service) with a **per-message `StatusCallback`** of
+  `absolute_url('/sms/status/<callback_token>/')` (built from `PUBLIC_BASE_URL`; supported under a
+  Messaging Service, where it overrides the service-level callback) — the token lets the callback
+  identify **this attempt** even with no captured SID. Classify the response by what is **proven**
+  (RFC 9110 §9.2.2: a non-idempotent POST's response does **not** prove no side effect):
+  - **HTTP 2xx + Message SID** → `state='sent'`, `message_sid=SID`; for `purpose='result'`, roll
+    `Registration.result_sms_state='sent'`. Accepted ≠ delivered (best-effort); the callback may
+    later confirm/deny it.
+  - **4xx documented as pre-acceptance** (invalid number/body), or a `21610` (blocked) →
+    `state='failed_permanent`. Terminal — not retried. A `21610` means the number is blocked at the
+    provider; it is logged, and the durable block is owned by the inbound STOP webhook (below), not
+    by the send response.
   - **5xx / connection error / timeout / no response / crashed worker** → `state='unknown'`. A 5xx
-    is a server error — it does **not** prove the message was not created (a 5xx can be emitted
-    *after* Twilio creates the message). `unknown` is **never** auto-retried on a timer; it is
-    flagged and reconciled by the callback below if one arrives.
-  `retry_sms` (`manage.py retry_sms`, Render Cron Job ~every 5 min) is **reconcile-gated**: it
-  re-attempts only `unknown` attempts that a callback has since confirmed reached a **terminal
-  transient** failure (`provider_status` `undelivered`/`failed` with a non-permanent error — the
-  message existed, is now terminal, and will never deliver, so re-sending cannot duplicate), and
-  only while the registration has `< N` attempts; each retry creates a **fresh** `SmsAttempt` (new
-  token). An `unknown` with **no** reconciling callback is **never** retried (a timer cannot prove
-  non-creation) — it is flagged for manual review. So the app makes **at most one** send it believes
-  succeeded per registration (no double-texts); FR-17/19 are best-effort, backstopped by the
-  edit-link status page (FR-41). Sends are concurrent (small pool); per-attempt try/except + logging.
-  (TC-057/062/065/069.)
+    does **not** prove the message was not created (it can be emitted *after* creation). `unknown`
+    is **never** auto-retried on a timer; it is flagged and reconciled by the callback below.
+  `retry_sms` (`manage.py retry_sms`, Render Cron Job ~every 5 min) is **reconcile-gated** and scoped
+  to `purpose='result'`: for each `unknown` attempt whose callback set a terminal `provider_status`
+  with `retryable=True`, it atomically claims the source (`retry_claimed_at__isnull=True → now()`,
+  one consumer — TC-071) and creates a **fresh** child `SmsAttempt` (`retry_of=source`, new token),
+  only while the registration has `< N` result attempts; it never selects `sent`/`failed_permanent`,
+  an `unknown` with `retryable` falsy/null, or one with no reconciling callback. So the app makes
+  **at most one** send it believes succeeded per registration (no double-texts); FR-17/19 are
+  best-effort, backstopped by the edit-link status page (FR-41). Sends are concurrent (small pool);
+  per-attempt try/except + logging. (TC-057/062/065/069/070/071/072.)
 - **Opt-out + delivery webhooks (FR-43)** — two signature-validated, CSRF-exempt Twilio webhooks
   (the only public POSTs exempt from CSRF):
   - **Inbound `/sms/inbound/`** (Advanced Opt-Out on the **Messaging Service**, which posts
@@ -266,19 +284,22 @@ Templates are `gettext`-marked Python helpers, rendered under `translation.overr
     registration the owner declined stays opted out; TC-060). Keyed by phone, it covers every
     registration sharing that number (R-2) and any created after the STOP (TC-061). Authenticated by
     `twilio.request_validator.RequestValidator` against `X-Twilio-Signature`; forged/unsigned POSTs
-    are rejected (TC-058/059).
+    are rejected (TC-058/059). **This inbound webhook is the sole writer of `PhoneBlock`** — opt-out
+    state is authoritative and chronologically ordered here, so a stale/delayed delivery callback
+    cannot re-block a number after START (TC-073).
   - **Delivery-status `/sms/status/<callback_token>/`** (per-message callback) — looks up the
     `SmsAttempt` **by `callback_token`** (so an `unknown` with a null `message_sid` is still
-    reconcilable, and a callback that arrives *before* the 2xx handler stored the SID still matches).
+    reconcilable, and a callback arriving *before* the 2xx handler stored the SID still matches).
     It sets `message_sid` from `MessageSid` if missing, advances `provider_status` **monotonically**
-    (terminal `delivered`/`undelivered`/`failed` are sticky — a late `queued`/`sent` cannot clobber
-    them), marks `reconciled=True` on a terminal status, rolls the registration to `sent` on
-    `delivered`, and upserts `PhoneBlock` on error `21610`. Duplicate callbacks are idempotent; an
-    unmatched token is logged/inboxed for later reconciliation (TC-064/066/067/068). This is how a
-    provider block / `21610` and delivery outcome are observed in production — `21610` is **not**
-    assumed to arrive synchronously (Twilio's docs don't guarantee it), so a synchronous `21610` on
-    the send response is a fast-path secondary signal only. The inbound STOP/START webhook remains
-    the authoritative opt-out source.
+    (terminal states sticky — a late `queued`/`sent` cannot clobber them), sets `provider_error_code`
+    from `ErrorCode` and the derived `retryable` flag, marks `reconciled=True` on a terminal status,
+    and rolls a `purpose='result'` registration to `sent` on `delivered`. **It does not write
+    `PhoneBlock`** — a `21610` in the callback only marks the attempt `failed_permanent` +
+    `retryable=False` and logs (the block, if any, came from the authoritative STOP webhook). A
+    duplicate callback is idempotent; an unmatched token returns 200 and is logged/alerted (not
+    durably stored in V1 — TC-068/064/066/067). This is how delivery outcome is observed in
+    production — `21610`/delivery is **not** assumed synchronous, so a synchronous `21610` on the
+    send response is a fast-path hint only.
   The website toggle (FR-42) changes application consent only and **cannot** clear a provider block —
   re-consent of a blocked number requires START (TC-055/056).
 
@@ -328,17 +349,17 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | Phase | Build | Key files | FRs / TCs |
 |---|---|---|---|
 | **0 Scaffolding** | `git init`; `.gitignore`; `startproject config .` + settings split; 8 app packages; requirements; `runtime.txt`; `render.yaml`; `.env.example`; `templates/` `static/` `locale/` | `manage.py`, `config/settings/base.py`, `config/urls.py`, `requirements/base.txt`, `render.yaml` | NFR-2 plumbing |
-| **1 Models + admin** | All 6 models (`Event`, `Registration`, `Animal`, `User`, `sms.PhoneBlock`, `sms.SmsAttempt`), `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS: `result_sms_state`/`_sent_at` rollup on Registration + `sms_opt_out` (app consent) + `sms.PhoneBlock` (phone-level provider block) + `sms.SmsAttempt` (per-send try: `callback_token`/`message_sid`/`state`/monotonic `provider_status`/`reconciled`); full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `sms/models.py`, `*/admin.py` | FR-1/2/8/14/37/38/43; TC-002, TC-009, TC-047 |
+| **1 Models + admin** | All 6 models (`Event`, `Registration`, `Animal`, `User`, `sms.PhoneBlock`, `sms.SmsAttempt`), `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS: `result_sms_state`/`_sent_at` rollup on Registration + `sms_opt_out` (app consent) + `sms.PhoneBlock` (phone-level provider block; written only by inbound STOP/START webhook) + `sms.SmsAttempt` (per-send try: `purpose`/`callback_token`/`message_sid`/`is_initial`+unique/`retry_of`+unique/`retry_claimed_at`/`state`/monotonic `provider_status`/`provider_error_code`/`retryable`/`reconciled`); full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `sms/models.py`, `*/admin.py` | FR-1/2/8/14/37/38/43; TC-002, TC-009, TC-047 |
 | **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade) behind a confirmation warning (R-9) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32/39; TC-001/003/033/035/048 |
 | **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z soft applicant cap → friendly full message; slight overshoot ok)**; `OwnerForm` (+ `sms_consent` checkbox, default on) + dynamic `AnimalFormSet(min_num=1, max_num=6)`; confirmation screen (no guaranteed time; shows the edit link even if SMS was declined); persist language; fire SMS #1 to consenters | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33/38/42; TC-004/005/006/007/008/010/011/016/037/046/047/051/054 |
 | **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); edit/remove always; **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
 | **5 Lottery** | `run_lottery` service (Event-row lock + post-lock guard) + exceptions; admin "Run lottery" action; `run_due_lotteries` command for the **auto-fallback at noon day-after-close** (R-4/FR-40) | `lottery/{services,exceptions,admin}.py`, `lottery/management/commands/run_due_lotteries.py` | FR-12/13/14/15/40; TC-012/013/014/015/049/050 |
-| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting, unblocked** registrant in stored language (send gated on `not sms_opt_out` **and** no `sms.PhoneBlock`); create a `SmsAttempt` per send with a per-message `StatusCallback` carrying an opaque token; classify 2xx→`sent`, 4xx-pre-acceptance/`21610`→`failed_permanent`(+`PhoneBlock`), **5xx/conn/timeout/crash→`unknown`**; **inbound webhook** (signature-validated; `OptOutType` STOP/START/HELP uppercase; writes `PhoneBlock` only; FR-43); **delivery-status webhook** `/sms/status/<token>/` (token-keyed reconciliation, monotonic `provider_status`, `21610`→`PhoneBlock`); **`retry_sms`** (reconcile-gated: retries only callback-confirmed terminal-transient `unknown`, fresh attempt, `<N` cap); wired after lottery run | `sms/templates.py`, `sms/views.py` (both webhooks), `sms/models.py`, `sms/management/commands/retry_sms.py`, `lottery/services.py` | FR-17/18/19/43; TC-017/018/019/055/056/057/058/059/060/061/062/064/065/066/067/068/069 |
+| **6 Lottery-result SMS #2** | `result_body` (3 branches); `notify_lottery_results` to every **consenting, unblocked** registrant in stored language (send gated on `not sms_opt_out` **and** no `sms.PhoneBlock`); atomic initial `SmsAttempt` INSERT (unique `(reg,purpose) WHERE is_initial`) with a per-message `StatusCallback` carrying an opaque token; classify 2xx→`sent`, 4xx-pre-acceptance/`21610`→`failed_permanent` (no `PhoneBlock` write), **5xx/conn/timeout/crash→`unknown`**; **inbound webhook** (signature-validated; `OptOutType` STOP/START/HELP uppercase; sole writer of `PhoneBlock`; FR-43); **delivery-status webhook** `/sms/status/<token>/` (token-keyed reconciliation, monotonic `provider_status`, `provider_error_code`→`retryable`; never writes `PhoneBlock`); **`retry_sms`** (reconcile-gated, `purpose='result'` only: one-consumer `retry_of` claim, fresh attempt, `<N` cap); URLs via `absolute_url`/`PUBLIC_BASE_URL` | `sms/templates.py`, `sms/views.py` (both webhooks), `sms/models.py`, `sms/management/commands/retry_sms.py`, `lottery/services.py` | FR-17/18/19/43; TC-017/018/019/055/056/057/058/059/060/061/062/064/065/066/067/068/069/070/071/072/073/074 |
 | **7 Clinic check-in + lookup** | `LoginRequiredMixin` views: `select_event` (session), `lookup` (AnimalID exact / fuzzy name+phone, **event-scoped**), `detail` (editable, `max_num=None`), add/remove/save, `check_in`; ordered waitlist list (no promotion) | `clinic/{views,urls}.py`, `templates/clinic/*` | FR-23/24/25/26/27; TC-025/026/027/028/029/030/034/036 |
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
 | **9 Export** | CSV streaming + XLSX builders | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
 | **10 Admin manual entry + AnimalID** | Admin create Registration (`created_by=admin`, no cap); "next available" AnimalID button; `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **Cron Job** running `manage.py retry_sms` ~every 5 min (FR-17); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + sender pool, **enable Advanced Opt-Out**, and wire its two signature-validated webhooks to the deployed site: inbound `/sms/inbound/` (`OptOutType` STOP/START/HELP→`PhoneBlock`) and delivery-status `/sms/status/<token>/` (per-message callbacks carry the attempt's opaque token; **required** for state/21610 reconciliation — FR-43) | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/058/059/060/061/062/063/064/065/066/067/068/069 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links + per-message callbacks); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command; **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **Cron Job** running `manage.py retry_sms` ~every 5 min (FR-17); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + sender pool, **enable Advanced Opt-Out**, and configure **one fixed service-level webhook** — the inbound `/sms/inbound/` (`OptOutType` STOP/START/HELP → `PhoneBlock`, sole writer; FR-43). The delivery-status path is **per-message** (`/sms/status/<token>/` passed at send), not a console-configured service callback | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/058/059/060/061/062/063/064/065/066/067/068/069/070/071/072/073/074 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -366,7 +387,9 @@ TC-060 (START never grants application consent), TC-061 (registration created af
 TC-062 (reconcile-gated retry_sms; permanent/unknown never retried), TC-064 (token-keyed delivery
 callback), TC-065 (5xx after creation→unknown, no dup), TC-066 (callback before response),
 TC-067 (out-of-order callbacks monotonic), TC-068 (duplicate/unmatched callback), TC-069
-(reconcile-gated vs no-callback unknown). E2E/manual/deploy: TC-005/006/010/011/020–030/033/034/036/037/038/040/063.
+(reconcile-gated vs no-callback unknown), TC-070 (atomic initial-send claim), TC-071 (one-consumer
+retry claim), TC-072 (retryability persists across restart), TC-073 (delayed 21610 can't undo START),
+TC-074 (command-path absolute URLs via `PUBLIC_BASE_URL`). E2E/manual/deploy: TC-005/006/010/011/020–030/033/034/036/037/038/040/063.
 
 ---
 
@@ -392,14 +415,19 @@ TC-067 (out-of-order callbacks monotonic), TC-068 (duplicate/unmatched callback)
 pre-deploy = `python manage.py migrate`) + one **Postgres** add-on (auto-injects `DATABASE_URL`).
 
 **Env vars (never in code):** `DATABASE_URL`, `SECRET_KEY`, `DEBUG=False`, `ALLOWED_HOSTS`,
-`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, **`TWILIO_MESSAGING_SERVICE_SID`** (the `MG…` Messaging
-Service — production sends go through it so Advanced Opt-Out + the inbound/status webhooks work;
-`TWILIO_FROM_NUMBER` is retained only for local-dev/console fallback), (+ bootstrap
-`ADMIN_USERNAME`/`ADMIN_PASSWORD`/`ADMIN_EMAIL`). **Twilio provisioning (once, in the Console):**
-create the Messaging Service, add a SMS-capable number to its sender pool, **enable Advanced
-Opt-Out**, and point both its inbound-SMS webhook (`/sms/inbound/`) and its delivery-status callback
-(`/sms/status/`) at the deployed site. Gotchas: link Postgres before first boot; WhiteNoise above
-other middleware; no writable disk at runtime → collectstatic at build.
+**`PUBLIC_BASE_URL`** (the canonical `https://<host>` origin — validated HTTPS; the single source for
+SMS edit-links and per-message `StatusCallback` URLs built by `absolute_url()`, so they are correct
+from request context **and** from cron/retry commands), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
+**`TWILIO_MESSAGING_SERVICE_SID`** (the `MG…` Messaging Service — production sends go through it so
+Advanced Opt-Out works; `TWILIO_FROM_NUMBER` is retained only for local-dev/console fallback), (+
+bootstrap `ADMIN_USERNAME`/`ADMIN_PASSWORD`/`ADMIN_EMAIL`). **Twilio provisioning (once, in the
+Console):** create the Messaging Service, add a SMS-capable number to its sender pool, **enable
+Advanced Opt-Out**, and point its **inbound-SMS webhook** at `<PUBLIC_BASE_URL>/sms/inbound/` (the one
+**fixed, service-level** webhook). The delivery-status callback is **not** a fixed service webhook —
+each send passes its own tokenized `<PUBLIC_BASE_URL>/sms/status/<callback_token>/` per message
+(supported under a Messaging Service; it overrides any service-level callback). Gotchas: link Postgres
+before first boot; WhiteNoise above other middleware; no writable disk at runtime → collectstatic at
+build.
 
 ---
 
@@ -412,10 +440,12 @@ other middleware; no writable disk at runtime → collectstatic at build.
   edit URL carries the token. Two people with identical name/phone/pet simply create two rows —
   nothing breaks. Clinic lookup by name/phone may return multiple matches; narrowing by RegistrantID
   or AnimalID resolves it. (Acceptable per review.) **SMS opt-out has two independent dimensions
-  (FR-43):** application consent (`sms_opt_out`) stays **per-registration**, while the **provider
-  block (`sms.PhoneBlock`) is phone-level** — a STOP or `21610` blocks the number, covering every
-  registration that shares it. A send requires **both** clear, so duplicate-phone rows can never end
-  up eligible for SMS while one of their owners declined.
+  (FR-43):** application consent (`sms_opt_out`) is **per-registration** — one owner declining does
+  **not** affect another registration sharing the phone, so two duplicate-phone rows may legitimately
+  differ in consent. The **provider block (`sms.PhoneBlock`)** is the only phone-level dimension: a
+  STOP (inbound webhook) blocks the number and fans out to every registration sharing it, while a
+  `21610` is a per-send failure (not a block). A send requires that registration's own consent clear
+  **and** no provider block for its phone.
 - **R-3 Status-display drift — ELIMINATED by design.** The `status` column stores only discrete
   admin-driven stages; the **displayed** open/closed label is computed live from
   `open_at`/`close_at`/`lottery_run_at`. So the admin always sees reality — no drift, no cron needed.

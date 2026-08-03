@@ -120,12 +120,13 @@ Event 1──* Registration 1──* Animal
   │            └── edit_token, animal_id, status, language, printed_at,
   │                sms_opt_out (app consent), result_sms_state/_sent_at (rollup)
   │            │
-  │            └──* sms.SmsAttempt (callback_token, message_sid, state,
-  │                  provider_status [monotonic], reconciled)  ← one per send try
+  │            └──* sms.SmsAttempt (purpose, callback_token, message_sid, is_initial/retry_of
+  │                  [unique atomic claims], state, provider_status [monotonic],
+  │                  provider_error_code/retryable, reconciled)  ← one per send try
   └── services_offered, x_seen, y_waitlist, z_applicants, open_at, close_at (auto close; no manual lock)
 
-sms.PhoneBlock(phone)  ── phone-level provider block (STOP/START/21610); send needs
-                          app-consent clear AND no PhoneBlock (FR-43)
+sms.PhoneBlock(phone)  ── phone-level provider block (written only by inbound STOP/START
+                          webhook); send needs app-consent clear AND no PhoneBlock (FR-43)
 
 User (admin/volunteer)  ── standalone, role label only (same priv)
 ```
@@ -156,9 +157,9 @@ GitHub repo  --(push)-->  Render Web Service (Django + gunicorn)
                             +--> Render Postgres (managed, daily backups)
 
 Environment variables (never in code):
-  DATABASE_URL, SECRET_KEY, DEBUG=False, ALLOWED_HOSTS,
-  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID (MG…; sends + Advanced
-  Opt-Out + the inbound/status webhooks hang off it), TWILIO_FROM_NUMBER (dev fallback only)
+  DATABASE_URL, SECRET_KEY, DEBUG=False, ALLOWED_HOSTS, PUBLIC_BASE_URL (canonical HTTPS origin
+  for SMS edit-links + per-message StatusCallback URLs), TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+  TWILIO_MESSAGING_SERVICE_SID (MG…; sends + Advanced Opt-Out), TWILIO_FROM_NUMBER (dev fallback only)
 ```
 
 Render provides: auto-HTTPS, health check, restart-on-crash, deploys from `prod`
@@ -198,14 +199,16 @@ lottery app: inside transaction.atomic(): lock + reload the Event row (select_fo
             assign sequential AnimalIDs (1..) in shuffled order; set statuses
             set `event.lottery_run_at = now` (the durable single-run guard)
             enqueue result SMS per registrant (all outcomes, in stored language)
-sms app:   per attempt: create a `SmsAttempt` (with a callback token in its per-message
-           `StatusCallback`); classify 2xx→`sent`, 4xx-pre-acceptance/`21610`→`failed_permanent`
-           (+`PhoneBlock`), **5xx/conn/timeout/crash→`unknown`** (a 5xx does NOT prove non-creation;
-           never auto-retried). Render EN/ES template --> Twilio (Messaging Service) --> owner phone
-           (FR-17/18/19). Send gated on `not sms_opt_out` **and** no `sms.PhoneBlock` (FR-42/43);
-           inbound webhook (uppercase `OptOutType` STOP/START/HELP) writes `PhoneBlock` only;
-           delivery-status callback (token-keyed, monotonic) reconciles state + 21610, and gates
-           retry (only callback-confirmed terminal-transient failures)
+sms app:   per attempt: atomic initial `SmsAttempt` INSERT (unique (reg,purpose) WHERE is_initial)
+           carrying a callback token in its per-message `StatusCallback`; classify 2xx→`sent`,
+           4xx-pre-acceptance/`21610`→`failed_permanent` (no `PhoneBlock` write), **5xx/conn/timeout/
+           crash→`unknown`** (a 5xx does NOT prove non-creation; never auto-retried). URLs via
+           `absolute_url`/`PUBLIC_BASE_URL`. Render EN/ES template --> Twilio (Messaging Service) -->
+           owner phone (FR-17/18/19). Send gated on `not sms_opt_out` **and** no `sms.PhoneBlock`
+           (FR-42/43); inbound webhook (uppercase `OptOutType` STOP/START/HELP) is the **sole writer**
+           of `PhoneBlock`; delivery-status callback (token-keyed, monotonic, sets
+           `provider_error_code`/`retryable`) reconciles state only and gates retry (one-consumer
+           `retry_of` claim; only callback-confirmed retryable terminal failures)
 
 Post-lottery (admin, ad-hoc):
 clinic app: admin creates a registration (owner+animals) and/or assigns the next AnimalID
@@ -310,7 +313,7 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
-15. ✅ SMS delivery + provider opt-out → at-most-once/best-effort delivery (per `SmsAttempt`: 2xx→`sent`, 4xx-pre-acceptance/`21610`→`failed_permanent`, **5xx/conn/timeout/crash→`unknown`**; nothing auto-retried on a timer — only a callback-confirmed terminal-transient failure is retried); two signature-validated webhooks on a Messaging Service — inbound STOP/START/HELP (uppercase `OptOutType`) writes a phone-level `sms.PhoneBlock` (never `sms_opt_out`), token-keyed delivery-status reconciles state + `21610`. Send needs app-consent clear AND no `PhoneBlock` (FR-43).
+15. ✅ SMS delivery + provider opt-out → at-most-once/best-effort delivery (per `SmsAttempt`: 2xx→`sent`, 4xx-pre-acceptance/`21610`→`failed_permanent`, **5xx/conn/timeout/crash→`unknown`**; nothing auto-retried on a timer — only a callback-confirmed retryable terminal failure is retried, one-consumer `retry_of` claim); atomic initial claim (unique `(reg,purpose)`); two signature-validated webhooks on a Messaging Service — inbound STOP/START/HELP (uppercase `OptOutType`) is the **sole writer** of a phone-level `sms.PhoneBlock` (never `sms_opt_out`), token-keyed delivery-status reconciles state only (does not write `PhoneBlock`). Send needs app-consent clear AND no `PhoneBlock`; URLs via `PUBLIC_BASE_URL` (FR-43).
 
 **Residual verification risks (not open decisions):**
 - Check-in concurrency — resolved by design (Postgres + the unique AnimalID index); verify under
