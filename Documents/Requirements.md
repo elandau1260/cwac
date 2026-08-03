@@ -207,16 +207,18 @@ sequence per event (the database enforces uniqueness within the event).
 
 ### 7.5 Owner edits via SMS link
 The edit link (`/r/EVENT/edit/TOKEN`) — sent in **SMS #1 to every consenting registrant**, and in **SMS #2 only to selected/waitlisted** — opens their entry
-without login. They can edit owner + animal fields and **remove** animals at any time. They can
-**add** animals **only while the window is open** (disabled after `close_at`). Once the
-registration is **checked-in** (or the event completes), self-edit locks.
+without login. **Read and mutate are separate** (this page is the reliable status channel — FR-41):
+the page **always renders** the entry + status, but the owner can edit owner/animal fields and
+**remove** animals only while editing is unlocked, and **add** animals **only while the window is
+open** (disabled after `close_at`). Once the registration is **checked-in** (or the event completes),
+**mutation locks** (POST is rejected server-side; GET still renders with a "locked" notice).
 
-The edit-link page also **shows the owner's current result** (FR-41): their assigned **AnimalID**
+The edit-link page always **shows the owner's current result** (FR-41): their assigned **AnimalID**
 if selected/waitlisted, a **"not selected"** notice once the lottery has run (or "pending" before),
-and the checked-in/printed state on clinic day — visible **even after editing locks**, so an owner
+and the checked-in/printed state on clinic day — visible **even after mutation locks**, so an owner
 can always learn their outcome without an SMS (e.g., if they declined texts or a text didn't
 deliver). The page also lets the owner **change their SMS preference** (FR-42): turn texts on/off,
-which sets `sms_opt_out`.
+which sets `sms_opt_out` (a preference change is itself a mutation, so it too is locked after check-in).
 
 ### 7.6 Clinic check-in + print (volunteer)
 Volunteer logs in → selects event → enters **AnimalID** (or searches by name/phone) → record
@@ -372,17 +374,17 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 
 **SMS (Twilio)**
 - **FR-16** Send a **signup-confirmation SMS immediately on registration** to owners who consented (FR-42), containing an edit link.
-- **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **fire-and-forget: best-effort, at-most-once, never retried** — each registrant is sent exactly once (2xx→`sent`; a 4xx or provider-block `21610`→`failed`; a 5xx/timeout/connection-loss/crash→`unknown`), so there are no double-texts. Not guaranteed; the edit-link status page (FR-41) is the reliable channel.
+- **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **fire-and-forget: best-effort, at-most-once, never retried** — `sent` means Twilio **accepted** the request (2xx); a synchronous 4xx (e.g. invalid number) → `failed`; a 5xx/timeout/connection-loss/crash → `unknown`. Each registrant is sent **at most once** (never twice — no double-texts); a crash can mean **zero** attempts. Not guaranteed; the edit-link status page (FR-41) is the reliable channel.
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** consenting registrants receive a courtesy result SMS (Decision 1).
 - **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets the **application-consent** flag `sms_opt_out` and skips SMS for that registration. This toggle is the only app-side SMS gate; it is independent of Twilio's provider-side blocklist (FR-43). The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
-- **FR-43** **Provider-side opt-out (not mirrored).** STOP/START/HELP are handled entirely by Twilio **Advanced Opt-Out** on the Messaging Service (enabled once in the Console): Twilio maintains the per-number blocklist, replies with the configured keyword text, and returns error `21610` on sends to blocked numbers — which the app classifies as a normal `failed` send (FR-17). The app does **not** receive an inbound webhook and does **not** mirror Twilio's blocklist, so there is no opt-out state to keep ordered or reconciled. The only app-side SMS gate is application consent (`sms_opt_out`, FR-42): a send goes out iff that registration's consent is clear. Re-consent of a provider-blocked number is by texting START (Twilio unblocks); the website toggle controls only application consent and is independent of the provider blocklist.
+- **FR-43** **Provider-side opt-out (not mirrored).** STOP/START/HELP are handled entirely by Twilio **Advanced Opt-Out** on the Messaging Service (enabled once in the Console): Twilio maintains the per-number blocklist and replies with the configured keyword text. A subsequent send to a blocked number is still **accepted** by the API (2xx → `sent`); Twilio then fails it **asynchronously** with `21610`, which the app does **not** observe (no callback) — and that is the desired outcome for an opted-out number, so the app makes no `21610`/`failed`-classification claim. The app does **not** receive an inbound webhook and does **not** mirror Twilio's blocklist, so there is no opt-out state to keep ordered or reconciled. The only app-side SMS gate is application consent (`sms_opt_out`, FR-42): a send goes out iff that registration's consent is clear. Re-consent of a provider-blocked number is by texting START (Twilio unblocks); the website toggle controls only application consent and is independent of the provider blocklist.
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to every consenting registrant, and shown on the confirmation page to those who declined SMS; in the lottery-result SMS only to selected/waitlisted — never to not-selected).
 - **FR-21** Owner can edit fields; **add and remove** animals while the window is open; **after `close_at`, add is disabled** (edit/remove still allowed); admin can always add.
 - **FR-22** Edit link valid from signup **until the registration is checked-in or the event completes**.
-- **FR-41** The edit-link page displays the owner's current result (assigned AnimalID for selected/waitlisted; "not selected" once the lottery has run; "pending" before; checked-in/printed state on clinic day) — visible even after self-edit locks, so SMS is not the only status channel.
+- **FR-41** The edit-link page displays the owner's current result (assigned AnimalID for selected/waitlisted; "not selected" once the lottery has run; "pending" before; checked-in/printed state on clinic day) — **GET renders this even after mutation locks** (check-in / event complete); only POST/edit is blocked. So SMS is not the only status channel.
 
 **Clinic check-in (volunteer/admin)**
 - **FR-23** Lookup by **AnimalID** or search by name/phone (fuzzy).

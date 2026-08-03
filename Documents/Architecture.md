@@ -88,7 +88,7 @@ existing Flutter/Android app reused solely as the label-print station.
 | `events` | Create/configure events; `open_at`/`close_at` window (auto close, no manual lock); per-event applicant cap Z; unique slug; QR/URL download; delete entire event; back-office via Django admin | FR-1..FR-4, FR-34, FR-38, FR-39 |
 | `register` | Public form; EN/ES; per-animal dynamic fields; 6-animal cap (≥1 animal; edit-form max tracks current count); required owner fields; SMS-consent checkbox (default on); stores chosen language; confirmation; token edit (add-while-open, add-disabled-after-close); edit-link shows lottery result; SMS opt-out toggle | FR-5..FR-11, FR-20..FR-22, FR-33, FR-41, FR-42 |
 | `lottery` | Random shuffle + select whole registrations to X/Y caps; assign sequential AnimalIDs; set statuses; single-run guard (manual click + noon auto-run) | FR-12..FR-15, FR-40 |
-| `sms` | Send signup-confirmation + lottery-result SMS via Twilio (Messaging Service) in the registration's stored language; **fire-and-forget** (gate: `not sms_opt_out`; one send per reg, 2xx→`sent` / 4xx,`21610`→`failed` / 5xx→`unknown`, never retried); STOP/START handled provider-side by Advanced Opt-Out (not mirrored) | FR-16..FR-19, FR-42, FR-43 |
+| `sms` | Send signup-confirmation + lottery-result SMS via Twilio (Messaging Service) in the registration's stored language; **fire-and-forget** (gate: `not sms_opt_out`; one send per reg, 2xx→`sent` (accepted) / 4xx→`failed` (sync) / 5xx→`unknown`, never retried); STOP/START handled provider-side by Advanced Opt-Out (not mirrored; async `21610` unobserved) | FR-16..FR-19, FR-42, FR-43 |
 | `clinic` | Lookup by AnimalID/name/phone; edit; add; remove; check-in; print → sets `printed_at`; admin manual entry create + AnimalID assignment | FR-23..FR-28, FR-35..FR-37 |
 | `printing` | Serve label payload (owner + grouped pet labels) to the print station | FR-28, NFR-4 |
 | `export` | CSV/XLSX export with the agreed columns | FR-29 |
@@ -195,12 +195,11 @@ lottery app: inside transaction.atomic(): lock + reload the Event row (select_fo
             set `event.lottery_run_at = now` (the durable single-run guard)
             enqueue result SMS per registrant (all outcomes, in stored language)
 sms app:   fire-and-forget: atomically claim `result_sms_state null→sending` (committed before the
-           POST), then classify 2xx→`sent`, 4xx/`21610`→`failed`, **5xx/conn/timeout/crash→`unknown`**
-           (a 5xx does NOT prove non-creation; never retried). Render EN/ES template --> Twilio
-           (Messaging Service) --> owner phone (FR-17/18/19). Send gated on `not sms_opt_out` only
-           (FR-42); STOP/START/HELP handled provider-side by Advanced Opt-Out (not mirrored, no
-           webhook — a blocked number returns `21610`→`failed`). URLs via `absolute_url`/
-           `PUBLIC_BASE_URL`
+           POST), then classify 2xx→`sent` (accepted), 4xx→`failed` (sync), **5xx/conn/timeout/crash→`unknown`**
+           (never retried). Render EN/ES template --> Twilio (Messaging Service) --> owner phone
+           (FR-17/18/19). Send gated on `not sms_opt_out` only (FR-42); STOP/START/HELP handled
+           provider-side by Advanced Opt-Out (not mirrored, no webhook — a blocked number is accepted
+           `sent`; the async `21610` is unobserved). URLs via `absolute_url`/`PUBLIC_BASE_URL`
 
 Post-lottery (admin, ad-hoc):
 clinic app: admin creates a registration (owner+animals) and/or assigns the next AnimalID
@@ -302,11 +301,10 @@ times, X, Y, Z, services, languages) is set per event by the admin (FR-1, FR-38)
 12. ✅ Applicant cap → per-event **Z** (max registrations) gates new signups (FR-38; plan R-10).
 13. ✅ Owner status visibility + SMS consent → edit-link page always shows the result; signup consent checkbox defaults on, toggleable via the edit link (FR-41/FR-42).
 14. ✅ Twilio budget + opt-out/consent wording → approved: signup consent checkbox (default on) + "Reply STOP to opt out" (Decision 13).
-15. ✅ SMS delivery → **fire-and-forget** (one send per registration: 2xx→`sent`, 4xx/`21610`→`failed`, 5xx/conn/timeout/crash→`unknown`; **never retried**, so at-most-once is trivially true); STOP/START handled provider-side by Twilio Advanced Opt-Out (not mirrored, no webhook). Send gated on `not sms_opt_out`; URLs via `PUBLIC_BASE_URL` (FR-42/43).
+15. ✅ SMS delivery → **fire-and-forget** (one send per registration: 2xx→`sent` (accepted), 4xx→`failed` (sync), 5xx/conn/timeout/crash→`unknown`; **never retried**, so at-most-once is trivially true); STOP/START handled provider-side by Twilio Advanced Opt-Out (not mirrored, no webhook; async `21610` unobserved). Send gated on `not sms_opt_out`; URLs via `PUBLIC_BASE_URL` (FR-42/43).
 
 **Residual verification risks (not open decisions):**
 - Check-in concurrency — resolved by design (Postgres + the unique AnimalID index); verify under
   load at the first busy event.
-- SMS delivery — best-effort by nature (phones off, carrier blocks); the delivery-state + retry
-  maximizes success but cannot guarantee it. Ambiguous `unknown` outcomes are flagged, never
-  auto-retried (at-most-once).
+- SMS delivery — best-effort by nature (phones off, carrier blocks); fire-and-forget (one send per
+  registration, never retried) cannot guarantee delivery — backstopped by the edit-link status page.

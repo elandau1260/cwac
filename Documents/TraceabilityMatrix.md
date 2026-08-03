@@ -33,11 +33,11 @@ are in §2.
 | **FR-15** | Statuses set correctly | TC-014 |
 | **FR-40** | Lottery auto-runs at noon (event tz) day-after-close if not run manually (single-run) | TC-049, TC-050 |
 | **FR-16** | Signup-confirmation SMS to consenters on register (with edit link) | TC-016 |
-| **FR-17** | Fire-and-forget lottery-result SMS to all consenting; selected/waitlisted include AnimalID (2xx→sent / 4xx,21610→failed / 5xx→unknown; never retried) | TC-017, TC-018, TC-055 |
+| **FR-17** | Fire-and-forget lottery-result SMS to all consenting; selected/waitlisted include AnimalID (`sent`=accepted; 2xx→sent / 4xx→failed / 5xx→unknown; never retried; at-most-one) | TC-017, TC-018, TC-055 |
 | **FR-18** | SMS in the language stored on the registration | TC-018, TC-046 |
 | **FR-19** | Not-selected consenting courtesy SMS | TC-019 |
 | **FR-42** | Signup SMS-consent checkbox (default on) = application consent; toggle via edit link; opted-out = no SMS, status still viewable | TC-054 |
-| **FR-43** | Provider-side opt-out (not mirrored): STOP/START/HELP handled by Twilio Advanced Opt-Out on the Messaging Service (no inbound webhook, no `PhoneBlock`); a send to a blocked number → `21610`→`failed`; app-side gate is `sms_opt_out` only; re-consent via START | TC-055, TC-056 |
+| **FR-43** | Provider-side opt-out (not mirrored): STOP/START/HELP handled by Twilio Advanced Opt-Out on the Messaging Service (no inbound webhook, no `PhoneBlock`); a send to a blocked number is accepted (`sent`) — the async `21610` is unobserved; app-side gate is `sms_opt_out` only; re-consent via START | TC-055, TC-056 |
 | **FR-20** | Token edit link opens entry, no login | TC-020 |
 | **FR-21** | Owner edits; add+remove while open; add disabled after close_at | TC-022, TC-023, TC-042 |
 | **FR-22** | Edit-link valid until check-in / event completion | TC-024 |
@@ -92,7 +92,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-021 | E2E | Owner edits an owner field + saves → change persists on reload. |
 | TC-022 | E2E | While the window is **open**, the owner can **add** an animal via the edit link + save → it persists. |
 | TC-023 | E2E | Owner removes an animal + saves → animal is gone; count decreased; persists. |
-| TC-024 | E2E | Open the edit link after the registration is checked-in (or after the event completes) → blocked with a message. |
+| TC-024 | E2E | Open the edit link after the registration is checked-in (or after the event completes): the page **still renders** (status banner + a "locked" notice — FR-41), but **POST/mutation is rejected** (add/edit/remove disabled server-side). Assert both halves: GET readable, POST blocked. |
 | TC-025 | E2E | Volunteer enters a valid AnimalID → matching registration+animals load. |
 | TC-026 | E2E | Search by partial name or phone → matching registrations returned (fuzzy). |
 | TC-027 | E2E | Volunteer edits an owner/animal field + saves → persists. |
@@ -117,14 +117,15 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
 | TC-047 | I | **Deterministic:** at `count == Z`, a new signup is rejected with an EN/ES "registration full" message; at `Z-1`, a single new signup is accepted; an existing owner at the event can still add an animal regardless of Z. **Soft-cap race (residual/load, not a unit assertion):** Z is a soft cap — the check + insert are not serialized, so concurrent signups at `Z-1` may overshoot by up to the number of requests in flight at the boundary. There is no hard ≤Z invariant; the overshoot is observed/verified under load, not asserted as a deterministic bound (R-10/Decision 12). |
 | TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
-| TC-049 | I | `run_due_lotteries` runs an event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched. |
-| TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same event → exactly one run wins (statuses/IDs set once); each registrant gets exactly one result SMS (idempotent). |
+| TC-049 | I | `run_due_lotteries` runs a **`live`** event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched; and an **expired `draft`** (or any non-`live` event) past its deadline is **not** run (TC requires Postgres for the row lock). |
+| TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same `live` event → exactly one run wins (statuses/IDs set once); each registrant gets **at most one** result SMS (fire-and-forget: a crash can mean zero, never two). Requires Postgres. |
 | TC-051 | I | Submitting a registration with zero animals → blocked (≥1 animal required); submit with 1 → accepted. |
 | TC-052 | I | An owner record a volunteer grew to 8 animals can still be edited/removed by the owner (max tracks current count); an owner at 6 cannot add a 7th. |
-| TC-053 | I | Open the edit link after the lottery: selected/waitlisted → shows their AnimalID; not-selected → shows a "not selected" notice; before the lottery → "pending". Status still shows after the edit locks (check-in / event complete). |
+| TC-053 | I | Open the edit link after the lottery: selected/waitlisted → shows their AnimalID; not-selected → shows a "not selected" notice; before the lottery → "pending". Status **still renders after the edit locks** (check-in / event complete) — GET shows the banner + "locked"; only mutation is blocked. |
 | TC-054 | I | Signup form shows an SMS-consent checkbox checked by default. Submit with it unchecked → `sms_opt_out=True`, no SMS sent (signup or result); status still visible on the edit-link page. Leave checked (or re-check via the edit link) → SMS sends normally. |
-| TC-055 | I | **Fire-and-forget result SMS:** a consenting registrant's result SMS is sent exactly once — atomic `result_sms_state null→sending` claim (committed before the POST), then 2xx→`sent`, a 4xx/`21610`→`failed`, a 5xx/timeout/connection-loss/crash→`unknown`; **never retried** (no double-text); `result_sms_sent_at` set only on `sent`. |
-| TC-056 | I | **Provider-side opt-out (not mirrored):** STOP/START/HELP are handled by Twilio Advanced Opt-Out on the Messaging Service; the app has **no** inbound webhook and **no** `PhoneBlock`. A send to a STOP'd number returns `21610`→`failed` (logged); texting START (to Twilio) lets later sends succeed again. Application consent (`sms_opt_out`, FR-42) is independent — one of two duplicate-phone registrations can decline while the other still receives SMS. |
+| TC-055 | I | **Fire-and-forget result SMS:** a consenting registrant's result SMS is sent **at most once** — atomic `result_sms_state null→sending` claim (committed before the POST), then 2xx→`sent` (accepted), a sync 4xx→`failed`, a 5xx/timeout/connection-loss/crash→`unknown`; **never retried** (no double-text); `result_sms_sent_at` set only on `sent`. A crash can leave `null` (zero attempts) or `sending` — neither resent. |
+| TC-056 | I | **Provider-side opt-out (not mirrored):** STOP/START/HELP are handled by Twilio Advanced Opt-Out on the Messaging Service; the app has **no** inbound webhook and **no** `PhoneBlock`. A send to a STOP'd number is still **accepted** (`sent`); the async `21610` is unobserved (correct — they opted out). Texting START (to Twilio) lets later sends deliver again. Application consent (`sms_opt_out`, FR-42) is independent — one of two duplicate-phone registrations can decline while the other still receives SMS. |
+| TC-057 | D | **SMS deploy smoke:** with a Messaging Service whose US sender is registered (A2P 10DLC Brand+Campaign, or verified toll-free) and Advanced Opt-Out enabled, send one live result-SMS to a real handset and confirm it is accepted (2xx) and arrives — before declaring SMS deployable. (Catches unregistered-sender blocking, which surfaces only against real US carriers.) |
 
 ---
 
@@ -146,12 +147,13 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
   FR-7/FR-10/FR-21.
 - **Status visibility & SMS consent:** TC-053 (edit-link shows result) and TC-054 (signup consent
   checkbox + opt-out) cover FR-41/FR-42.
-- **SMS delivery & provider opt-out:** TC-055 (fire-and-forget: one send, 2xx→sent / 4xx,21610→
-  failed / 5xx→unknown, never retried) and TC-056 (STOP/START handled provider-side by Advanced
-  Opt-Out — not mirrored; app-consent independent) cover FR-17 and FR-43.
+- **SMS delivery & provider opt-out:** TC-055 (fire-and-forget: one send, 2xx→sent (accepted) /
+  4xx→failed / 5xx→unknown, never retried; at-most-one) and TC-056 (STOP/START handled provider-side
+  by Advanced Opt-Out — not mirrored; async `21610` unobserved; app-consent independent) cover FR-17
+  and FR-43. TC-057 is the live SMS deploy smoke (registered US sender).
 - **Labels:** TC-031/TC-040 verify grouped pet labels (~3/label), not one-per-animal.
 - **Test automation targets:** unit (TC-002, TC-009, TC-012, TC-013, TC-015) and integration
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
   TC-043, TC-044, TC-045, TC-046, TC-047, TC-048, TC-049, TC-050, TC-051, TC-052, TC-053, TC-054,
-  TC-055, TC-056) should be automated. The locking tests (TC-047, TC-050) require PostgreSQL.
-  E2E (browser) and manual/deploy tests are run before each release.
+  TC-055, TC-056) should be automated. The locking tests (TC-047, TC-049, TC-050) require PostgreSQL.
+  E2E (browser) and manual/deploy tests (incl. TC-057) are run before each release.
