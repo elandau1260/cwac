@@ -75,7 +75,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 12 — Applicant cap Z (FR-38; plan R-10)
-**Decision:** Per-event **Z** (target max registrations/owners), admin-configured alongside X and Y. Once reached, new signups are rejected with a friendly EN/ES "full" message. Gates only brand-new signups — existing owners may still add animals. **Z is a soft cap**: the capacity check + insert are not serialized, so concurrent signups at the boundary may push the count a few over Z — acceptable (no lock, no hard limit). The overshoot is bounded by the number of in-flight signups at the boundary (small for human-paced submissions), so the SMS blast is ~Z, not exactly Z.
+**Decision:** Per-event **Z** (target max registrations/owners), admin-configured alongside X and Y. Once reached, new signups are rejected with a friendly EN/ES "full" message. Gates only brand-new signups — existing owners may still add animals. **Z is a soft cap**: the capacity check + insert are not serialized, so concurrent signups at the boundary may push the count over Z — by at most the number of signups in flight at the boundary. This is **not a deterministic invariant** (no lock, no hard ≤Z) and is verified as **residual/load behavior** (TC-047), not a unit assertion; for human-paced submissions the in-flight count is small, so the SMS blast is ~Z, not exactly Z.
 **Your answer:** ✅ Confirmed — per-event soft applicant cap Z.
 
 ---
@@ -88,13 +88,15 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 
 ## Decision 14 — Owner status visibility + SMS consent (FR-41/FR-42)
 **Decision:** The edit-link page **always shows the owner's current result** (AnimalID / "not selected" / "pending" / checked-in) — even after self-edit locks — so an owner can learn their outcome **without an SMS**. SMS consent is a **checkbox on the signup form, checked by default**; unchecking (or toggling later on the edit link) sets `sms_opt_out` and skips all SMS, while status stays viewable on the edit-link page. The result SMS still goes to **every** consenting registrant, including a courtesy text to not-selected (Decision 1 stands).
-**Your answer:** ✅ Confirmed — edit-link shows result (FR-41); SMS consent checkbox default-on + opt-out (FR-42); result text to everyone (Decision 1 kept).
+**Your answer:** ✅ Confirmed — edit-link shows result (FR-41); SMS consent checkbox default-on + opt-out (FR-42); result text to every consenting registrant (Decision 1 kept).
 
 ---
 
 ## Decision 15 — SMS delivery + provider-side STOP/START (FR-43)
-**Decision:** SMS delivery is **at-most-once and best-effort** (a delivery state tracks each send; only transient failures are retried — never a `sent` or an ambiguous `unknown`, so no double-texts) — not guaranteed, backstopped by the edit-link status page (FR-41). "Reply STOP to opt out" is made real provider-side: a **signature-validated inbound STOP/START webhook** (Twilio Advanced Opt-Out) syncs `sms_opt_out` phone-level; outbound treats a Twilio `21610` block as a durable opt-out, and re-consent requires START (the website toggle can't override a provider block).
-**Your answer:** ✅ Confirmed — best-effort delivery + STOP/START webhook (FR-43).
+**Decision:** SMS delivery is **at-most-once and best-effort** — a delivery state (`result_sms_state`) tracks each send and is classified by what can be **proven**: `sent` on a definitive acceptance, `failed_transient` on a definitive non-acceptance **response** (5xx — the only retryable class), `failed_permanent` on a definitive client error (4xx / synchronous `21610`), and `unknown` on any ambiguous outcome (timeout, connection reset, crashed worker). Only `failed_transient` is retried (never `sent`/`failed_permanent`/`unknown`, so no double-texts); stale `sending` claims (crashed workers) are reclassified to `unknown`, never auto-retried. Delivery is not guaranteed, backstopped by the edit-link status page (FR-41).
+
+Opt-out is split into **two independent dimensions**: **application consent** (`sms_opt_out`, per-registration, owner-controlled via FR-42) and a **phone-level provider block** (`sms.PhoneBlock`, written only by Twilio). A send requires **both** clear. "Reply STOP to opt out" is made real provider-side over a **Messaging Service** (Advanced Opt-Out, which posts `OptOutType`) with **two signature-validated webhooks**: inbound `/sms/inbound/` (STOP→upsert `PhoneBlock`, START→delete it; writes only the block, so START never grants application consent), and a delivery-status `/sms/status/` callback (reconciles state; surfaces `21610` to a `PhoneBlock`). A synchronous `21610` on a send response is a best-effort secondary signal — Twilio's docs don't guarantee the mechanism — so the inbound STOP/START webhook remains the authoritative opt-out source. The website toggle can't override a provider block; re-consent requires START. Provider Message SID is stored (`result_sms_provider_sid`) to support the callback and reconciliation.
+**Your answer:** ✅ Confirmed — at-most-once/best-effort delivery + two-dimension opt-out (application consent vs phone-level provider block) via a Messaging Service (FR-43).
 
 ---
 

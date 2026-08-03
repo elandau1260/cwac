@@ -1,7 +1,7 @@
 # Veterinary Clinic Pre-Registration — Requirements (V1)
 
 **Status:** Draft for review
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-03
 **Source:** Email thread `communications/Re_Clinic_Pre-Registration.txt` + follow-up decisions (see `Decisions.md`)
 
 ---
@@ -117,7 +117,7 @@ AnimalID, edits as needed, and **prints labels**.
 | `edit_token` | For the SMS edit link (created at signup) |
 | `language` | **EN/ES the owner chose at signup — drives the SMS language** |
 | `printed_at` | Set when labels print = owner showed up (nullable) |
-| `sms_opt_out` | Boolean (default **false**). Set by the signup consent checkbox (FR-42); when true, no SMS is sent — the owner tracks status via the edit link (FR-41) |
+| `sms_opt_out` | Boolean (default **false**) — **application-level consent only** (per-registration). Set by the signup consent checkbox or the edit-link toggle (FR-42). A *separate* phone-level provider block (`sms.PhoneBlock`) captures STOP/START/`21610` (FR-43); a send requires **both** this flag false **and** no provider block. When either blocks it, no SMS is sent — the owner tracks status via the edit link (FR-41) |
 | **Owner fields (all required)** | first name, last name, phone, email, address |
 | `created_at`, `updated_at`, `created_by` | owner (self) vs admin/volunteer |
 
@@ -204,7 +204,7 @@ couldn't register online), the admin can **manually create registrations** (owne
 sequence per event (the database enforces uniqueness within the event).
 
 ### 7.5 Owner edits via SMS link
-The edit link (`/r/EVENT/edit/TOKEN`) — sent in **SMS #1 to everyone**, and in **SMS #2 only to selected/waitlisted** — opens their entry
+The edit link (`/r/EVENT/edit/TOKEN`) — sent in **SMS #1 to every consenting registrant**, and in **SMS #2 only to selected/waitlisted** — opens their entry
 without login. They can edit owner + animal fields and **remove** animals at any time. They can
 **add** animals **only while the window is open** (disabled after `close_at`). Once the
 registration is **checked-in** (or the event completes), self-edit locks.
@@ -284,7 +284,7 @@ website and exposes the existing native `printLabel` channel to the page via a J
 |---|---|
 | Web framework | **Django** — recommended because its built-in **admin, auth, forms+validation, i18n, ORM, and CSV helpers map directly onto these requirements**, so we write little custom back-office code. Lean on Django's admin for event config, manual entry management, and export. |
 | Database | **PostgreSQL** (concurrent writes at check-in rule out SQLite) |
-| SMS | **Twilio** (pay-per-message, ~1¢/text; ~$1/mo number) |
+| SMS | **Twilio** via a **Messaging Service** (pay-per-message, ~1¢/text; Advanced Opt-Out + STOP/START + delivery-status webhooks hang off the service — FR-43) |
 | Hosting | **PaaS — Render** (managed Postgres add-on, auto-HTTPS, deploy from GitHub). Railway is an alternative. |
 | Print station | Existing **Flutter/Android** app (`../vet_app`) reused for the 3nStar printer |
 
@@ -321,6 +321,9 @@ website and exposes the existing native `printLabel` channel to the page via a J
 - ✅ SMS consent/opt-out → signup checkbox defaults to **on**; owner can uncheck or toggle later
   via the edit link (FR-42); status still viewable without texts
 - ✅ Twilio budget + opt-out/consent wording → approved (Decision 13)
+- ✅ SMS delivery + provider-side STOP/START → at-most-once/best-effort delivery; two-dimension
+  opt-out (application consent vs phone-level provider block) via a Messaging Service with Advanced
+  Opt-Out (Decision 15; FR-43)
 
 ---
 
@@ -370,8 +373,11 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-17** After the lottery, send a **result SMS to every consenting registrant** in their chosen language; selected/waitlisted include the AnimalID + edit link; not-selected receive a courtesy text with **no link**. Delivery is **at-most-once and best-effort** — each registrant gets at most one send the app believes succeeded (no double-texts); not guaranteed, backstopped by the edit-link status page (FR-41).
 - **FR-18** SMS language follows the owner's chosen language (stored on the registration).
 - **FR-19** **Not-selected** consenting registrants receive a courtesy result SMS (Decision 1).
-- **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets `sms_opt_out` and skips all SMS. The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
-- **FR-43** **STOP/START opt-out sync.** Twilio STOP/START keywords received via an inbound-SMS webhook — **authenticated by Twilio's `X-Twilio-Signature`** (the one public POST exempt from CSRF) — update `sms_opt_out` (STOP → opted out; START → re-consented) for **every registration matching that phone number**. Outbound skips opted-out numbers and treats a Twilio block (error 21610) as a durable, phone-level opt-out; the website toggle cannot override a provider block — re-consent requires START.
+- **FR-42** The signup form has an **SMS-consent checkbox (checked by default)**; unchecking it (or toggling later via the edit link) sets the **application-consent** flag `sms_opt_out` and skips SMS for that registration. This toggle is **application-level only** — it cannot clear a phone-level provider block (FR-43). The signup confirmation is still shown on-screen; status remains viewable on the edit-link page (FR-41). Opt-out/consent wording confirmed: checkbox + "Reply STOP to opt out" on every SMS (Decision 13).
+- **FR-43** **Provider-side opt-out — two independent dimensions.** Application consent (`sms_opt_out`, FR-42) is **per-registration and owner-controlled**. The **provider block** is a **separate, phone-level** record (`sms.PhoneBlock`) written **only** by Twilio, never by the website toggle. A send requires **both** clear. Concretely:
+  - **STOP/START** arrive via an inbound-SMS webhook on the **Messaging Service** (Twilio Advanced Opt-Out, which posts `OptOutType`), **authenticated by `X-Twilio-Signature`** (`RequestValidator`) — one of the two public POSTs exempt from CSRF. STOP upserts a `PhoneBlock` for the normalized `From`; START deletes it. The webhook writes **only** the provider block — **START never grants application consent**, so a registration the owner explicitly declined stays opted out.
+  - A Twilio block (`21610`) observed on a send response **or** via the **delivery-status callback** (`/sms/status/`, the second signature-validated webhook) also upserts a `PhoneBlock`. `21610` is **not** assumed synchronous (Twilio's docs don't guarantee the mechanism), so it is a best-effort secondary signal; the inbound STOP/START webhook is the authoritative opt-out source.
+  - Because the block is keyed by phone, it covers every registration sharing that number (R-2) and any created after the STOP. Re-consent of a blocked number requires START (the website toggle cannot override a provider block).
 
 **Owner edit (token)**
 - **FR-20** Edit link `/r/EVENT/edit/TOKEN` opens the entry without login (link sent in the signup SMS to every consenting registrant, and shown on the confirmation page to those who declined SMS; in the lottery-result SMS only to selected/waitlisted — never to not-selected).

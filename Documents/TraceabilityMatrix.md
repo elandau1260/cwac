@@ -1,7 +1,7 @@
 # Requirements → Tests Traceability Matrix (V1)
 
 **Status:** Draft for review
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-03
 **Companion docs:** `Requirements.md` (Appendix A = requirement IDs), `Architecture.md`, `Decisions.md`
 
 Requirement IDs (FR-x / NFR-x) are defined in `Requirements.md` Appendix A. Test case details
@@ -33,11 +33,11 @@ are in §2.
 | **FR-15** | Statuses set correctly | TC-014 |
 | **FR-40** | Lottery auto-runs at noon (event tz) day-after-close if not run manually (single-run) | TC-049, TC-050 |
 | **FR-16** | Signup-confirmation SMS to consenters on register (with edit link) | TC-016 |
-| **FR-17** | At-most-once/best-effort lottery-result SMS to all consenting; selected/waitlisted include AnimalID | TC-017, TC-018, TC-057 |
+| **FR-17** | At-most-once/best-effort lottery-result SMS to all consenting; selected/waitlisted include AnimalID | TC-017, TC-018, TC-057, TC-062 |
 | **FR-18** | SMS in the language stored on the registration | TC-018, TC-046 |
 | **FR-19** | Not-selected consenting courtesy SMS | TC-019 |
-| **FR-42** | Signup SMS-consent checkbox (default on); toggle via edit link; opted-out = no SMS, status still viewable | TC-054 |
-| **FR-43** | Signature-validated inbound STOP/START webhook syncs sms_opt_out (phone-level); outbound skips opted-out + treats Twilio 21610 as durable opt-out; re-consent via START | TC-055, TC-056, TC-058, TC-059 |
+| **FR-42** | Signup SMS-consent checkbox (default on) = application consent; toggle via edit link; opted-out = no SMS, status still viewable (cannot clear a provider block — FR-43) | TC-054, TC-060 |
+| **FR-43** | Two-dimension opt-out: application consent (FR-42, per-reg) vs phone-level provider block (`sms.PhoneBlock`, Twilio-only). Send needs both clear. STOP/START + delivery-status webhooks on a Messaging Service, both signature-validated; START never grants app consent; 21610 secondary; re-consent via START | TC-055, TC-056, TC-058, TC-059, TC-060, TC-061, TC-063, TC-064 |
 | **FR-20** | Token edit link opens entry, no login | TC-020 |
 | **FR-21** | Owner edits; add+remove while open; add disabled after close_at | TC-022, TC-023, TC-042 |
 | **FR-22** | Edit-link valid until check-in / event completion | TC-024 |
@@ -115,7 +115,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-044 | I | Admin creates a registration manually (owner + animals) → saved with `created_by`=admin; lookup-able by name/phone; the 6-animal cap is not enforced. |
 | TC-045 | I | Admin assigns an AnimalID to a registration → accepted if unique within the event (1..999); a duplicate is rejected; the entry is then lookup-able by that AnimalID. |
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
-| TC-047 | I | With Z reached, a new signup is rejected with an EN/ES "registration full" message; an existing owner at the event can still add an animal. Z is a soft cap: with C concurrent signups at Z−1, assert final count ≤ Z + C (overshoot bounded by in-flight requests — small for human-paced submissions, not a hard invariant). |
+| TC-047 | I | **Deterministic:** at `count == Z`, a new signup is rejected with an EN/ES "registration full" message; at `Z-1`, a single new signup is accepted; an existing owner at the event can still add an animal regardless of Z. **Soft-cap race (residual/load, not a unit assertion):** Z is a soft cap — the check + insert are not serialized, so concurrent signups at `Z-1` may overshoot by up to the number of requests in flight at the boundary. There is no hard ≤Z invariant; the overshoot is observed/verified under load, not asserted as a deterministic bound (R-10/Decision 12). |
 | TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
 | TC-049 | I | `run_due_lotteries` runs an event whose noon deadline (event tz, day after `close_at`) has passed but that isn't yet run; an event not yet at its deadline is left untouched. |
 | TC-050 | I | A manual "Run lottery" and the cron auto-run fired concurrently on the same event → exactly one run wins (statuses/IDs set once); each registrant gets exactly one result SMS (idempotent). |
@@ -123,11 +123,16 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-052 | I | An owner record a volunteer grew to 8 animals can still be edited/removed by the owner (max tracks current count); an owner at 6 cannot add a 7th. |
 | TC-053 | I | Open the edit link after the lottery: selected/waitlisted → shows their AnimalID; not-selected → shows a "not selected" notice; before the lottery → "pending". Status still shows after the edit locks (check-in / event complete). |
 | TC-054 | I | Signup form shows an SMS-consent checkbox checked by default. Submit with it unchecked → `sms_opt_out=True`, no SMS sent (signup or result); status still visible on the edit-link page. Leave checked (or re-check via the edit link) → SMS sends normally. |
-| TC-055 | I | An owner texts STOP → the signature-validated inbound webhook sets `sms_opt_out=True` on **every registration sharing that phone**; the next result-SMS send to that number is skipped. They text START → `sms_opt_out` cleared; sends resume. |
-| TC-056 | I | Outbound to a Twilio-blocked number returns 21610 → app sets `sms_opt_out=True` (durable) and logs; a website toggle-on alone does not resume delivery until START is received. |
-| TC-057 | I | Result-SMS delivery is at-most-once: a transient failure (5xx/conn) is re-attempted by the `retry_sms` sweep (atomic re-claim, capped attempts); a confirmed `sent` and an ambiguous `unknown` (timeout) are **never** re-sent — no double-texts. An `unknown` is flagged for review; a permanent 4xx/`21610` opts the phone out. |
-| TC-058 | I | The `/sms/inbound/` webhook rejects a POST with a missing/invalid `X-Twilio-Signature` (no state change); a properly signed STOP/START is accepted. |
-| TC-059 | I | Two registrations share one phone; one owner texts STOP → both registrations are opted out (no contradictory consent); a later result SMS to that number is skipped for both. |
+| TC-055 | I | An owner texts STOP → the signature-validated inbound webhook (`OptOutType=stop`) upserts a phone-level `sms.PhoneBlock` (never touches `sms_opt_out`); the next result-SMS send to that number is skipped because the send requires **no** `PhoneBlock`. They text START → the `PhoneBlock` is deleted; sends to a still-consenting registration resume. |
+| TC-056 | I | A synchronous `21610` on an outbound send **or** a `21610` in a delivery-status callback → app upserts `sms.PhoneBlock` (durable) and logs. A website toggle-on (clearing `sms_opt_out`) alone does **not** resume delivery while the `PhoneBlock` exists — START is required. START clears the block but does not change application consent. (The real production path is verified by TC-063; the mocked synchronous `21610` here is the fast-path secondary signal only.) |
+| TC-057 | I | Result-SMS delivery is at-most-once, classified by what is **proven**: (a) a definitive **non-acceptance response** (5xx) → `failed_transient`, re-attempted by `retry_sms` (atomic re-claim, capped attempts); (b) a **permanent** 4xx (invalid number) → `failed_permanent`, never retried; (c) any **ambiguous** outcome — timeout, connection reset/interrupted, or no definitive response — → `unknown`, **never** auto-retried (the message may have been queued), flagged for review; (d) a stale `sending` claim (crashed worker, older than threshold) → reclassified to `unknown`. A confirmed `sent` is never re-sent. No double-texts. Attempt count/last-attempt come from durable fields, not `updated_at`. |
+| TC-058 | I | The `/sms/inbound/` and `/sms/status/` webhooks reject a POST with a missing/invalid `X-Twilio-Signature` (no state change); a properly signed STOP/START (or status callback) is accepted. |
+| TC-059 | I | Two registrations share one phone; one owner texts STOP → a single phone-level `PhoneBlock` is created; a later result SMS to that number is skipped for **both** registrations (the block is keyed by phone, not registration — no contradictory consent), including a registration created after the STOP. |
+| TC-060 | I | Application consent is independent of the provider block: a registration whose owner unchecked the website box (`sms_opt_out=True`) stays opted out after a START (START deleted the `PhoneBlock` but left `sms_opt_out`); a send is still skipped. Conversely, clearing `sms_opt_out` via the toggle while a `PhoneBlock` exists still skips the send. |
+| TC-061 | I | A registration created **after** an earlier STOP on its phone is blocked at send time — the `PhoneBlock` is durable and phone-level (not carried by any single registration), so a brand-new row inherits the existing block. |
+| TC-062 | I | `retry_sms` selects only `failed_transient` rows whose `result_sms_last_attempt_at` is older than the threshold **and** `result_sms_attempts < N`, each behind an atomic re-claim; it never selects `sent`/`failed_permanent`/`unknown`. After a command restart, the selection, threshold, and attempt cap are unchanged (state is in durable fields, not `updated_at`). |
+| TC-063 | D | Deploy smoke: with the Messaging Service provisioned (sender pool + Advanced Opt-Out enabled) and both webhooks pointed at the site, a live STOP → `/sms/inbound/` creates a `PhoneBlock`, a subsequent send to that number is skipped, and a live START deletes it and resumes — verifying the real Twilio path (not a mocked `21610`). |
+| TC-064 | I | The `/sms/status/` callback (signature-validated) updates `result_sms_state`/`result_sms_provider_sid` for a matching `MessageSid`; a callback carrying error `21610` upserts a `sms.PhoneBlock`. |
 
 ---
 
@@ -149,12 +154,15 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
   FR-7/FR-10/FR-21.
 - **Status visibility & SMS consent:** TC-053 (edit-link shows result) and TC-054 (signup consent
   checkbox + opt-out) cover FR-41/FR-42.
-- **SMS delivery & provider opt-out:** TC-055 (STOP, phone-level), TC-056 (START/21610), TC-057
-  (at-most-once retry), TC-058 (webhook signature rejection), and TC-059 (duplicate-phone STOP)
-  cover FR-43 and the at-most-once/best-effort delivery model (FR-17).
+- **SMS delivery & provider opt-out:** TC-055 (STOP → `PhoneBlock`), TC-056 (`21610`/START), TC-057
+  (at-most-once, both failure windows), TC-058 (webhook signature rejection), TC-059 (duplicate-phone
+  STOP), TC-060 (app consent independent of provider block), TC-061 (new registration after STOP),
+  TC-062 (`retry_sms` selection/threshold/cap), TC-063 (deploy smoke on the real Messaging Service),
+  and TC-064 (delivery-status callback) cover FR-43 and the at-most-once/best-effort delivery model
+  (FR-17).
 - **Labels:** TC-031/TC-040 verify grouped pet labels (~3/label), not one-per-animal.
 - **Test automation targets:** unit (TC-002, TC-009, TC-012, TC-013, TC-015) and integration
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
   TC-043, TC-044, TC-045, TC-046, TC-047, TC-048, TC-049, TC-050, TC-051, TC-052, TC-053,
-  TC-054, TC-055, TC-056, TC-057, TC-058, TC-059) should be automated. E2E (browser) and
-  manual/deploy tests are run before each release.
+  TC-054, TC-055, TC-056, TC-057, TC-058, TC-059, TC-060, TC-061, TC-062, TC-064) should be
+  automated. E2E (browser) and manual/deploy tests (incl. TC-063) are run before each release.
