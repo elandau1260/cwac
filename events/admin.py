@@ -13,8 +13,11 @@ import zoneinfo
 
 from django import forms
 from django.contrib import admin
+from django.urls import reverse
 from django.utils import timezone
+from django.utils.html import format_html
 
+from accounts.models import User
 from .models import Event
 
 #: Fallback timezone for a brand-new event whose timezone field hasn't been
@@ -127,6 +130,7 @@ class EventAdminForm(forms.ModelForm):
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
     form = EventAdminForm
+    delete_confirmation_template = "admin/events/event/delete_confirmation.html"
 
     list_display = (
         "name",
@@ -135,6 +139,7 @@ class EventAdmin(admin.ModelAdmin):
         "status",
         "signup_state",
         "registration_count",
+        "flyer_link",
         "lottery_run_at",
     )
     list_filter = ("status", "timezone", "date")
@@ -147,9 +152,10 @@ class EventAdmin(admin.ModelAdmin):
         "created_at",
         "updated_at",
         "registration_count",
+        "flyer_link",
     )
     fieldsets = (
-        (None, {"fields": ("slug", "name", "description")}),
+        (None, {"fields": ("slug", "name", "description", "flyer_link")}),
         (
             "Schedule",
             {
@@ -181,6 +187,13 @@ class EventAdmin(admin.ModelAdmin):
     def registration_count(self, obj):
         return obj.registrations.count()
 
+    @admin.display(description="Signup flyer / QR")
+    def flyer_link(self, obj):
+        if obj is None or obj.pk is None:
+            return "Save the event first to create its signup URL and QR code."
+        url = reverse("events:flyer", kwargs={"pk": obj.pk})
+        return format_html('<a href="{}">View URL and download QR JPG</a>', url)
+
     @admin.display(description="Signups")
     def signup_state(self, obj):
         """The *actual* signup window right now (FR-4), computed from
@@ -189,3 +202,26 @@ class EventAdmin(admin.ModelAdmin):
         signups are accepted at this moment, so a ``live`` event whose window
         has closed (or hasn't opened) shows "Closed", not "open for signups"."""
         return "Open" if obj.signup_open() else "Closed"
+
+    # Event configuration is an Admin-only capability (Decision 16 / FR-30).
+    # Django's admin site already requires ``is_staff`` (only CWAC Admins have
+    # it), and these explicit role checks keep the model permissions correct
+    # even if an inconsistent user is introduced outside the supported manager.
+    @staticmethod
+    def _is_cwac_admin(request):
+        return getattr(request.user, "role", None) == User.Role.ADMIN
+
+    def has_module_permission(self, request):
+        return self._is_cwac_admin(request)
+
+    def has_view_permission(self, request, obj=None):
+        return self._is_cwac_admin(request)
+
+    def has_add_permission(self, request):
+        return self._is_cwac_admin(request)
+
+    def has_change_permission(self, request, obj=None):
+        return self._is_cwac_admin(request)
+
+    def has_delete_permission(self, request, obj=None):
+        return self._is_cwac_admin(request)
