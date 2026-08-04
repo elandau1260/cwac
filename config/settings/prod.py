@@ -28,3 +28,15 @@ SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 
 # ALLOWED_HOSTS comes from the environment in prod (render.yaml sets it).
+
+# Fail closed on SMS: production must send through a Messaging Service (Advanced
+# Opt-Out works only on one) and know its canonical origin. Refuse to boot if
+# either is missing/malformed when SMS_BACKEND=twilio, rather than silently
+# sending via a bare from-number or building edit-links against the wrong origin.
+from ._sms_guard import validate_twilio_prod_config
+
+validate_twilio_prod_config(
+    sms_backend=SMS_BACKEND,
+    public_base_url=PUBLIC_BASE_URL,
+    messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+)

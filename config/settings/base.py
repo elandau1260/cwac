@@ -128,7 +128,15 @@ SMS_BACKEND = env("SMS_BACKEND", default="console")
 # Twilio credentials — env only, used only when SMS_BACKEND == "twilio".
 TWILIO_ACCOUNT_SID = env("TWILIO_ACCOUNT_SID", default="")
 TWILIO_AUTH_TOKEN = env("TWILIO_AUTH_TOKEN", default="")
-TWILIO_FROM_NUMBER = env("TWILIO_FROM_NUMBER", default="")
+TWILIO_MESSAGING_SERVICE_SID = env(
+    "TWILIO_MESSAGING_SERVICE_SID", default=""
+)  # MG… Messaging Service (prod sends + Advanced Opt-Out)
+TWILIO_FROM_NUMBER = env("TWILIO_FROM_NUMBER", default="")  # local-dev/console fallback only
+
+# Canonical https:// origin for SMS edit-links, built without a request context
+# (e.g. from the lottery notification path). prod.py fails closed if this is
+# missing/malformed while SMS_BACKEND=twilio.
+PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", default="")
 
 # Light observability (Architecture §12): lottery runs, SMS send attempts, print.
 LOGGING = {

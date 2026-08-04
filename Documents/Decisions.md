@@ -26,7 +26,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 4 — AnimalID assignment (FR-14)
-**Decision:** The lottery **randomly selects** people (not in signup order, so people who borrowed a phone aren't disadvantaged), then assigns **sequential AnimalIDs starting at 1** (1, 2, 3, …), **max 999**, to selected + waitlisted. Manual additions by **staff (admin or volunteer)** take the next available number; assigning an ID to a `registered`/`not_selected` row also admits it (`status` → `selected`). Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next animal." Uniqueness is DB-enforced.
+**Decision:** The lottery **randomly selects** people (not in signup order, so people who borrowed a phone aren't disadvantaged), then assigns **sequential AnimalIDs starting at 1** (1, 2, 3, …, **max 999**) to selected + waitlisted. **Staff additions are a separate sequence starting at 1000** (walk-ins / admissions, added at the clinic after the lottery) and are **not counted toward X or Y** — so a staff-added row can never displace a lottery outcome. Assigning a 1000+ ID to a `registered`/`not_selected` row admits it (`status` → `selected`); the system assigns the next number (staff never type one, and IDs on already-numbered rows are never edited). Sequential numbering makes it easy to hand out pre-numbered stickers and "call the next animal." Uniqueness is DB-enforced. *(Round-7 revision: staff IDs move from "next in 1–999" to a dedicated 1000+ sequence so they cannot bypass the X/Y caps; see FR-14/FR-36/FR-37.)*
 **Your answer:** ✅ Confirmed — random selection + sequential IDs.
 ✅ **Confirmed:** start value is **1** (sequential 1, 2, 3, …; max 999). Resolved 2026-08-02 — matches the Implementation Plan, Requirements, and the data model (`next_animal_id` = max+1 else 1).
 
@@ -39,8 +39,8 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 6 — Lottery re-run / edge cases (FR-12, FR-36, FR-37)
-**Decision:** The lottery is a **single run**; it is not re-run or tweaked. For edge cases (walk-ins, people who couldn't register online), **staff (admin or volunteer)** can manually create registrations and assign an AnimalID (next in the 1–999 sequence); assigning an ID to a `registered`/`not_selected` row admits it (`status` → `selected`, atomically with the ID). Uniqueness is DB-enforced.
-**Your answer:** ✅ Confirmed — single run; **staff (admin or volunteer)** manual add + assign IDs (assigning an ID to a `registered`/`not_selected` row admits it → `selected`).
+**Decision:** The lottery is a **single run**; it is not re-run or tweaked. For edge cases (walk-ins, people who couldn't register online), **staff (admin or volunteer)** add the registration at the clinic (after the lottery) and the system assigns the **next ID in the 1000+ staff sequence** (not counted toward X/Y); admitting a `registered`/`not_selected` row sets `status='selected'` atomically with the ID. No ID is typed or edited on an already-numbered row. Uniqueness is DB-enforced. *(Round-7 revision: staff IDs move to a dedicated 1000+ sequence.)*
+**Your answer:** ✅ Confirmed — single run; **staff (admin or volunteer)** add walk-ins / admit existing rows; the system assigns the next 1000+ ID (not counted toward X/Y); admit sets `status='selected'`.
 
 ---
 
@@ -104,7 +104,7 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 ---
 
 ## Decision 16 — Admin vs volunteer privileges (FR-30)
-**Decision:** **Differentiated privileges** (supersedes the earlier "same privileges" wording). **Admin-only** capabilities: create / configure / delete events (FR-1/FR-39), run the lottery (FR-12 — the noon auto-run via cron is system-level, not a user privilege — FR-40), and export data (FR-29). **Both roles** perform all clinic-day operations: look up, edit, add, remove, check-in, print, manual entry, and assign AnimalID (FR-23..FR-28, FR-35..FR-37). **Provisioning:** Admin → `is_staff=True` (Django-admin access); Volunteer → `is_staff=False` (clinic views only); `is_superuser` stays `False` unless explicitly granted; `role` and `is_staff` are set together. **Enforcement:** Admin-only custom views use a `role == admin` mixin; the Django admin gates on `is_staff` (so volunteers cannot enter it).
+**Decision:** **Differentiated privileges** (supersedes the earlier "same privileges" wording). **Admin-only** capabilities: create / configure / delete events (FR-1/FR-39), run the lottery (FR-12 — the noon auto-run via cron is system-level, not a user privilege — FR-40), and export data (FR-29). **Both roles** perform all clinic-day operations: look up, edit, add, remove, check-in, print, manual entry, and assign AnimalID (FR-23..FR-28, FR-35..FR-37). **Provisioning:** an Admin is a Django **superuser** — `is_staff=True`, `is_superuser=True`, `role=admin` (full Django-admin access; created via `createsuperuser`/`ensure_admin`); a Volunteer is `is_staff=False`, `is_superuser=False`, `role=volunteer` (clinic views only). The custom `UserManager` (and `User.clean()`) **reject every inconsistent combination**, so there is no path that provisions a volunteer-role superuser or a privileged volunteer. **Enforcement:** Admin-only custom views use a `role == admin` mixin; entering the Django admin requires `is_staff`, and an Admin's full model access comes from its superuser status.
 **Your answer:** ✅ Confirmed — Admin-only = event create/configure/delete + run lottery + export; both roles = all clinic operations.
 
 ---

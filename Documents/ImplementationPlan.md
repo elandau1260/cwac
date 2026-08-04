@@ -92,14 +92,16 @@ migration is made.
 - `open_at`, `close_at` DateTimeField(db_index); `x_seen`, `y_waitlist`, `z_applicants` PositiveIntegerField — **X** animals seen / **Y** waitlist animals / **Z** = soft applicant cap (target max registrations) per event: the point at which new signups stop; a small overshoot under concurrent signups is acceptable (R-10). All three are admin-configured per event (no hardcoded values).
 - `timezone` CharField via `django-timezone-field` (IANA select, default `America/Los_Angeles`) — **per-event, admin-selectable**; sets when "noon" (the auto-lottery deadline) is **and the timezone in which `open_at`/`close_at` are entered and displayed**. `USE_TZ=True`; datetimes stored UTC; a custom admin form converts `open_at`/`close_at` to/from the event's `timezone` so the admin always sees/enters local times for that clinic.
 - `offers_flea_deworming`, `offers_microchip`, `offers_vaccination`, `offers_vet` BooleanField(default=False)
-- `status` CharField(choices=draft/live/lottery_run/active/completed, default=draft) — the open↔closed distinction is a **computed display label** (open iff `status == 'live'` and `open_at ≤ now < close_at`), never stored (R-3)
+- `status` CharField(choices=draft/live/lottery_run/active/completed, default=draft) — the open↔closed distinction is a **computed display label** (open iff `status == 'live'` and `open_at ≤ now < close_at`), never stored (R-3). `status` is **forward-only and read-only outside `transition()`**: the admin form sets it `editable=False`, so an Admin cannot regress `lottery_run`/`completed → live` to reopen signups or re-enable mutations (FR-4/TC-058).
 - `lottery_run_at` DateTimeField(null, blank) — durable **single-run guard** (the lottery sets it once; also the marker the auto-run check uses). It is **not** a signup gate — signups are time-window + `live`-status driven (FR-4)
+- `next_staff_id` PositiveIntegerField(default=1000) — per-event counter for **staff walk-in/admit IDs (≥1000)**; incremented under the Event-row lock by `allocate_staff_animal_id` (these IDs are not counted toward X/Y)
 - `created_at`, `updated_at`
-- **Methods (authoritative):** `@property services_offered`; `is_published()` = `status == 'live'`; `signup_open(now=None)` = `is_published() and open_at ≤ now < close_at` (**FR-4: signups are accepted only during `[open_at, close_at)`**; once the lottery runs, `status` advances past `live`, which also closes signups — so reopening `close_at` after the lottery cannot reopen signups); `at_capacity()` = `registrations.count() >= z_applicants` (**soft cap** — not locked; concurrent signups at the boundary may overshoot by a few, which is acceptable; R-10); `auto_run_deadline()` = noon (12:00 local) on the calendar day after `close_at`, computed in `self.timezone` (returns a tz-aware datetime for comparison against `timezone.now()`); `owner_can_add(reg)` = `signup_open() and reg.status != 'checked_in'`; `owner_can_edit(reg)` = `status != 'completed' and reg.status != 'checked_in'`. The **new-signup** view additionally requires `not at_capacity()` — Z gates only brand-new registrations, not an existing owner adding animals. The check + insert are deliberately **not serialized** (no Event-row lock): Z is a soft target and a few over is fine (R-10; TC-047). Displayed open/closed is computed live — no cached drift.
+- **Methods (authoritative):** `@property services_offered`; `is_published()` = `status == 'live'`; `transition(target, *, by=None)` — the **only** way `status` changes: runs inside `transaction.atomic()`, **locks + reloads the Event row** (`select_for_update().get(pk=self.pk)`), validates **exactly one forward step** (`draft→live→lottery_run→active→completed`), `raise InvalidTransition` on a backward or skip move, then saves — so every transition (Publish, Run-lottery→`lottery_run`, Activate, Complete, **and the lottery's own `live→lottery_run`**) is atomic and one-step; `signup_open(now=None)` = `is_published() and lottery_run_at is None and open_at ≤ now < close_at` (**FR-4:** signups only during `[open_at, close_at)`; the `lottery_run_at is None` term is **defense-in-depth** — even if `status` were forced back to `live`, signups stay closed once the lottery has run; reopening `close_at` after the lottery cannot reopen signups); `at_capacity()` = `registrations.count() >= z_applicants` (**soft cap** — not locked; concurrent signups at the boundary may overshoot by a few, which is acceptable; R-10); `auto_run_deadline()` = noon (12:00 local) on the calendar day after `close_at`, computed in `self.timezone` (returns a tz-aware datetime for comparison against `timezone.now()`); `owner_can_add(reg)` = `signup_open() and reg.status != 'checked_in'`; `owner_can_edit(reg)` = `status != 'completed' and reg.status != 'checked_in'`. The **new-signup** view additionally requires `not at_capacity()` — Z gates only brand-new registrations, not an existing owner adding animals. The check + insert are deliberately **not serialized** (no Event-row lock): Z is a soft target and a few over is fine (R-10; TC-047). Displayed open/closed is computed live — no cached drift.
 
 ### `register.Registration`
 - `event` FK(Event, related_name=registrations, CASCADE)
-- `animal_id` PositiveIntegerField(null, blank)
+- `animal_id` PositiveIntegerField(null, blank) — **read-only outside the allocation services** (the lottery + the staff allocate service); `editable=False` in forms/admin. Lottery assigns **1..999**; staff walk-in/admit assigns **≥1000**.
+- `id_source` CharField(null, choices lottery/staff) — set when `animal_id` is assigned; `clean()` cross-checks range↔source (`lottery` ⇒ 1..999, `staff` ⇒ ≥1000), because `1..999 ∪ ≥1000` covers every positive integer and the range alone cannot prove the allocator.
 - `status` choices: registered/selected/waitlisted/not_selected/checked_in (default registered)
 - `edit_token` CharField(unique, db_index, default=`generate_edit_token`) — 256-bit; `generate_edit_token`
   is a **module-level callable** (`def generate_edit_token(): return secrets.token_urlsafe(32)`) so each
@@ -126,9 +128,13 @@ migration is made.
   unobserved). When True, signup + result SMS are skipped; status is still shown on the edit-link
   page (FR-41).
 - `first_name`, `last_name` CharField(100); `phone` CharField(20) E.164; `email` EmailField; `address` CharField(300) — **all required**
-- `created_by` choices self/admin (default self); `created_at`, `updated_at`
+- `creation_source` CharField(choices public/staff, default public) — `public` (owner via the web form) or `staff` (admin/volunteer created it)
+- `created_by_user` FK(`accounts.User`, null=True) — the staff User that created a `staff`-source row (null for `public`)
+- `admitted_by_user` FK(`accounts.User`, null=True) + `admitted_at` DateTimeField(null=True) — set when staff **admit** an existing `public` row (assign a 1000+ ID); the row's `creation_source`/`created_by_user` are left untouched
+- `created_at`, `updated_at`
 - **Meta.constraints:** `UniqueConstraint(fields=[event, animal_id], condition=Q(animal_id__isnull=False))`
-- **classmethod** `next_animal_id(event)` = (max non-null animal_id in event)+1, else 1
+- **classmethod** `next_animal_id(event)` = (max non-null `animal_id` in event, **lottery range 1..999 only**)+1, else 1 — used by the lottery only
+- **classmethod** `allocate_staff_animal_id(event, reg)` — under `transaction.atomic()`, **locks + reloads the `Event` row**, reads `event.next_staff_id`, assigns it to `reg` (`id_source='staff'`), increments `event.next_staff_id`, saves both — atomic, so no `max()+1` race and no deleted-highest-ID reuse
 - **property** `is_attended` = `printed_at is not None`
 
 ### `register.Animal`
@@ -140,7 +146,7 @@ migration is made.
 - **No `weight` field** (FR-8/TC-009)
 
 ### `accounts.User`
-`AbstractUser` + `role` choices admin/volunteer (default volunteer). **Differentiated privileges (FR-30/Decision 16):** Admin-only = create/configure/delete events, run the lottery, export data (an Admin additionally does everything a volunteer can); **both roles** do clinic operations — lookup, edit, add, remove, check-in, print, manual entry, assign AnimalID. **Provisioning:** Admin → `is_staff=True` (Django-admin access); Volunteer → `is_staff=False` (clinic views only); `is_superuser` stays `False` for both unless explicitly granted. **Enforcement:** Admin-only custom views use a `role == admin` mixin; the Django admin gates on `is_staff` (so volunteers cannot enter it); `role` and `is_staff` are set together at provisioning (the `ensure_admin` command and any user-create flow keep them consistent).
+`AbstractUser` + `role` choices admin/volunteer (default volunteer) + a custom **`UserManager`** (subclasses the contrib `UserManager`, `use_in_migrations=True`) that keeps `role` consistent with the privilege flags. **Differentiated privileges (FR-30/Decision 16):** Admin-only = create/configure/delete events, run the lottery, export data (an Admin additionally does everything a volunteer can); **both roles** do clinic operations — lookup, edit, add, remove, check-in, print, walk-in add, admit. **Provisioning:** an Admin is a Django **superuser** — `is_staff=True` + `is_superuser=True` + `role=admin` (full Django-admin access; via `createsuperuser`/`ensure_admin`); a Volunteer is `is_staff=False`/`is_superuser=False`/`role=volunteer`. **The manager (sync + async) and `User.clean()` reject every inconsistent combination** — `create_user`/`acreate_user` raise on any staff/superuser flag or `role=admin`; `create_superuser`/`acreate_superuser` raise on `is_staff`/`is_superuser=False` or `role=volunteer`. **Enforcement:** Admin-only custom views use a `role == admin` mixin; the Django admin requires `is_staff` to enter and an Admin's model access comes from superuser status. (Migration `0002_manager_and_repair` swaps the manager and repairs any pre-existing volunteer-role superuser to `role=admin`.)
 
 ---
 
@@ -161,18 +167,32 @@ the first commits, re-reads a non-null `lottery_run_at`, and exits (TC-050). The
 
 0. Reload + lock the `Event` row; guard `lottery_run_at is None` **and** `status == 'live'` **and** `now > close_at` (FR-12).
 1. `rng.shuffle(regs)` — random, **not** signup order (TC-013). Default `rng = random.Random()`.
-2. Single pass, tagging each reg's bucket: while `sel_total < x_seen` → `selected` (+n animals);
-   elif `wl_total < y_waitlist` → `waitlisted` (+n); else `not_selected`.
-   - **Overshoot proof:** let **M** = the largest animal count among the eligible registrations
-     (≤6 for owner-submitted rows; larger only for a record staff grew past 6 — FR-25/36/TC-052).
-     The boundary reg is added only while the running total is still below the cap; before it the
-     total was ≤ cap−1 and that reg has ≤ M animals → final ∈ `[cap, cap+M−1] ⊂ [cap, cap+M)`. For
-     the typical all-owner case (M=6) this is the original `[cap, cap+5]`. Satisfies FR-13/TC-012.
+2. **Two buckets, each computed on the *remainder* after the prior** (a selected-bucket overshoot
+   reduces the pool available for the waitlist — so "total between X and X+Y" is not the rule). For
+   each bucket with target `T` (selected `T = x_seen`, then waitlist `T = y_waitlist`): walk the
+   remaining regs accumulating the animal count; **include** a reg while the running total is still
+   `< T` (the reg that crosses `T` is included — that is the overshoot). **If the regs run out before
+   `T` is reached, assign all remaining to that bucket and allow the total to fall below `T`**
+   (short demand — the bucket is simply under-filled). Regs left after the waitlist bucket →
+   `not_selected`.
+   - **Per-bucket overshoot bound:** let **M** = the largest animal count among the regs eligible for
+     *that* bucket. If enough animals exist to reach `T`, the bucket total ∈ `[T, T+M)` (the boundary
+     reg is added only while the running total was `< T`, i.e. ≤ `T−1` before it, and has ≤ M animals
+     → final ∈ `[T, T+M−1] ⊂ [T, T+M)`). If not enough animals exist, the total is just `< T` (all
+     remaining regs taken). For a typical all-owner bucket M ≤ 6; a staff-grown >6 row is possible
+     via FR-25/TC-052, in which case M is that row's count. Satisfies FR-13/TC-012.
+   - **Low / zero demand:** if there are **0 registrations**, no statuses change and no IDs are
+     assigned, but the lottery still **completes** (`lottery_run_at` set, `status='lottery_run'`).
+     **X or Y may each be 0:** `X=0` skips the selected bucket (regs flow to waitlist / `not_selected`);
+     `Y=0` skips the waitlist bucket; `X=Y=0` ⇒ every reg `not_selected`. (Staff-added 1000+ rows are
+     post-lottery and are never in `regs`.)
 3. Second pass over **same shuffled order**: for each reg tagged selected/waitlisted, assign
-   `animal_id = next_id` (from 1); raise `LotteryCapacityExceeded` if `next_id > 999` (FR-14).
-   `not_selected` get no ID.
-4. `bulk_update` statuses + animal_id; set `event.lottery_run_at = now()`, `event.status =
-   'lottery_run'`; save. After this `signup_open()` is permanently False.
+   `animal_id = next_id` (from 1, **lottery range 1..999 only**); raise `LotteryCapacityExceeded` if
+   `next_id > 999` (FR-14). `not_selected` get no ID. (`id_source='lottery'`.)
+4. `bulk_update` statuses + `animal_id` + `id_source`; set `event.lottery_run_at = now()` and advance
+   `event.status` to `'lottery_run'` **via `event.transition('lottery_run')`** (the atomic one-step
+   `live→lottery_run` move, under the held Event-row lock). After this `signup_open()` is permanently
+   False (status is past `live` **and** `lottery_run_at` is set).
 
 Admin trigger: a Django admin **action "Run lottery"** on the Event changelist (enabled only when
 `status == 'live'`, `lottery_run_at is None`, and `now > close_at`). TC-013 runs ~2000 seeded
@@ -290,7 +310,7 @@ validate_min=True, max_num=N, validate_max=True)`:
   the JS-bridge call, then calls `mark_printed`.
 
 ### Export (`export/`) — CSV + XLSX
-`export_event(event_slug, fmt)` (login required). CSV via `csv.writer` + `StreamingHttpResponse`;
+`export_event(event_slug, fmt)` (**Admin-only, role-gated — FR-29/Decision 16**). CSV via `csv.writer` + `StreamingHttpResponse`;
 XLSX via `openpyxl` → `BytesIO`. Columns: owner first/last name, phone, address, email; per animal
 name, species, age, sex, breed, color, services; plus status, AnimalID, language, printed.
 **Default = one row per animal** (owner + AnimalID repeated — best for the Admin's per-animal vaccine
@@ -303,7 +323,7 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | Phase | Build | Key files | FRs / TCs |
 |---|---|---|---|
 | **0 Scaffolding** | `git init`; `.gitignore`; `startproject config .` + settings split; 8 app packages; requirements; `runtime.txt`; `render.yaml`; `.env.example`; `templates/` `static/` `locale/` | `manage.py`, `config/settings/base.py`, `config/urls.py`, `requirements/base.txt`, `render.yaml` | NFR-2 plumbing |
-| **1 Models + admin** | All 4 models (`Event`, `Registration`, `Animal`, `User`), `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS on `Registration`: `result_sms_state`/`_sent_at` (fire-and-forget) + `sms_opt_out` (application consent); no SMS-specific models; full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` | `events/models.py`, `register/models.py`, `accounts/models.py`, `*/admin.py` | FR-1/2/8/14/37/38; TC-002, TC-009, TC-047 |
+| **1 Models + admin** | All 4 models (`Event`, `Registration`, `Animal`, `User`), `makemigrations`, partial unique index, read-time window helpers + `z_applicants` soft cap + per-event `timezone` (IANA select) + `auto_run_deadline` + **tz-aware `open_at`/`close_at` entry/display**; SMS on `Registration`: `result_sms_state`/`_sent_at` (fire-and-forget) + `sms_opt_out` (application consent); no SMS-specific models; full Django admin (back-office) with fieldsets, list_display/filter/search, `next_animal_id` + `allocate_staff_animal_id`; forward-only `Event.transition()` (`status` `editable=False`; `signup_open` also requires `lottery_run_at is None`); `Event.next_staff_id` + `Registration.id_source`; provenance `creation_source`/`created_by_user`/`admitted_by_user`/`admitted_at`; custom `UserManager` + `User.clean()` (Admin = superuser) | `events/models.py`, `register/models.py`, `accounts/models.py`, `*/admin.py` | FR-1/2/4/8/14/30/37/38; TC-002, TC-009, TC-047, TC-058, TC-059 |
 | **2 Auth + Event admin + QR/URL** | `accounts` login/logout (lean on `LoginView`); auto `slug` (slugify + uniqueness loop, retry on `IntegrityError`); flyer page with sign-up URL + "Download QR JPG" (`qrcode`→Pillow→`HttpResponse` jpg); admin **delete entire event** (cascade, **Admin-only**) behind a confirmation warning (R-9); event create/configure are likewise **Admin-only** (role-gated — Decision 16) | `accounts/views.py`, `events/admin.py`, `events/services_qr.py`, `events/views.py`, `templates/registration/login.html` | FR-1/2/3/30/32/39; TC-001/003/033/035/048 |
 | **3 Public form + i18n + SMS #1** | `signup(slug)` guarded by `signup_open()` **and `not at_capacity()` (R-10: Z soft applicant cap → friendly full message; slight overshoot ok)**; `OwnerForm` (+ `sms_consent` checkbox, default on) + dynamic `AnimalFormSet(min_num=1, max_num=6)`; confirmation screen (no guaranteed time; shows the edit link even if SMS was declined); persist language; fire SMS #1 to consenters | `register/{views,forms,urls}.py`, `sms/{services,templates,backends/*}.py`, `locale/es/…django.po`, `templates/register/{signup,confirm}.html` | FR-5/6/7/8/9/10/11/16/18/31/33/38/42; TC-004/005/006/007/008/010/011/016/037/046/047/051/054 |
 | **4 Token edit + window rules** | `edit_entry(slug, token)`; `owner_can_edit`/`owner_can_add` guards; add disabled post-close (server-validated); **edit/remove until check-in/event-completion** (mutation locks after that; GET always renders — FR-41); **status banner (FR-41) + SMS-preference toggle (FR-42)**; atomic save | `register/views.py`, `templates/register/edit.html` | FR-20/21/22/34/41/42; TC-020/021/022/023/024/041/042/053/054 |
@@ -312,8 +332,8 @@ notes; matches "per animal" in FR-29); `?per=registration` rollup optional (TC-0
 | **7 Clinic check-in + lookup** | `LoginRequiredMixin` views: `select_event` (session), `lookup` (AnimalID exact / fuzzy name+phone, **event-scoped**), `detail` (editable, `max_num=None`), add/remove/save, `check_in`; ordered waitlist list (no promotion) | `clinic/{views,urls}.py`, `templates/clinic/*` | FR-23/24/25/26/27; TC-025/026/027/028/029/030/034/036 |
 | **8 Print payload + stub + printed_at** | `label_payload`, `mark_printed`, browser print stub | `printing/{views,urls,serializers}.py`, `templates/clinic/print_stub.html` | FR-28/35 (backend half); TC-031/043 |
 | **9 Export (Admin-only)** | CSV streaming + XLSX builders (role-gated: admin only — FR-29/Decision 16) | `export/{views,urls,exporters}.py` | FR-29; TC-032 |
-| **10 Manual entry + AnimalID (both roles)** | Create Registration (`created_by=staff`, no 6-animal cap — FR-36) from the **clinic UI (both admin & volunteer)** plus the Django-admin back-office; "next available" AnimalID button (FR-37); **assigning an ID to a `registered`/`not_selected` row atomically sets `status='selected'`** (admit → status banner shows the ID, clinic-lookup-able, exported); `clean()` + partial index enforce 1..999 + event-unique (catch `IntegrityError`) | `clinic/views.py`, `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
-| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command (creates the initial **Admin** with `is_staff=True`; **volunteers** are provisioned later with `is_staff=False` — Decision 16); **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; off by default, no webhooks — FR-43); **deploy smoke (TC-057, FR-43/NFR-3)** — on a real US handset: send a live result-SMS (accepted 2xx + arrives), then **verify Advanced Opt-Out is actually enabled** by exercising STOP → next send blocked → HELP reply → START → delivery restored. SMS is not deployable until TC-057 passes. | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
+| **10 Walk-in add + admit (both roles, post-lottery)** | **Add walk-in** (clinic UI, both admin & volunteer): create Registration (`creation_source=staff`, `created_by_user`=actor, no 6-animal cap — FR-36); **admit** an existing `registered`/`not_selected` row (FR-37). Both **auto-assign the next 1000+ ID via `allocate_staff_animal_id`** (locks `Event.next_staff_id`) and atomically set `status='selected'` (admit leaves `creation_source`/`created_by_user` untouched; records `admitted_by_user`/`admitted_at`); the system assigns the number — **no manual ID entry, no editing IDs on numbered rows**; 1000+ IDs are **not counted toward X/Y**; both rejected before the lottery has run. `clean()` + partial index enforce 1..999/≥1000 + event-unique (catch `IntegrityError`) | `clinic/views.py`, `register/{admin,forms}.py` | FR-36/37; TC-044/045 |
+| **11 Deploy to Render** | `render.yaml` (web service + Postgres); `prod.py` (DEBUG=False, SSL redirect, secure cookies, WhiteNoise, `dj_database_url` ssl); set **`PUBLIC_BASE_URL`** (canonical HTTPS origin for SMS edit-links); migrations in `preDeployCommand`, collectstatic at build; `ensure_admin` command (creates the initial **Admin** as a Django superuser — `is_staff=True` + `is_superuser=True` + `role=admin`; **volunteers** are provisioned later as `is_staff=False`/`is_superuser=False`/`role=volunteer` — Decision 16); **Cron Job** running `manage.py run_due_lotteries` hourly (R-4/FR-40 auto-lottery); **provision a Twilio Messaging Service** (`TWILIO_MESSAGING_SERVICE_SID`) + a **US sender registered for A2P 10DLC** (Brand + Campaign) **or a verified toll-free number** — a one-time approval with **days of lead time**, required for US application-to-person messaging (complete *before* deploy; Oakland recipients are US); enable **Advanced Opt-Out** (STOP/START/HELP provider-side; off by default, no webhooks — FR-43); **deploy smoke (TC-057, FR-43/NFR-3)** — on a real US handset, using a **fresh registration for each probe send** (the app sends at most one result-SMS per registration): **HELP first** → confirm the HELP reply (an opted-out number may not receive it, so test HELP before STOP); then send a live result-SMS → accepted (2xx) + arrives; then STOP → STOP reply + next send blocked; then START → START reply + delivery restored. SMS is not deployable until TC-057 passes. | `render.yaml`, `config/settings/prod.py`, `config/wsgi.py`, `accounts/management/commands/ensure_admin.py` | NFR-1/2/3, FR-32/40/43; TC-038/039/049/055/056/057 |
 | **12 (outline) Flutter print station** | Convert `/home/dev/vet_app` → WebView shell over the deployed site; JS bridge → existing `MethodChannel('com.example.vet_app/printer')`; **rewrite native TSC layout** in `MainActivity.kt::printLabel` to consume the grouped payload; Print button → bridge → `mark_printed`. | `/home/dev/vet_app/**` | NFR-4 (full); TC-040 |
 
 ---
@@ -453,9 +473,10 @@ no writable disk at runtime → collectstatic at build.
    yes/no, language).
 6. **Automated:** `pytest` — green across the unit/integration TCs above (esp. TC-012/013/014/015).
 7. **Deploy:** push to GitHub → Render build/deploy → site reachable over HTTPS; confirm Twilio creds
-   are absent from the repo (`git grep`). **Run the SMS deploy smoke (TC-057):** a live result-SMS is
-   accepted (2xx) and arrives on a real US handset, then STOP → next send blocked, HELP reply, START →
-   delivery restored — to confirm Advanced Opt-Out is enabled. Do not declare SMS deployable until
-   TC-057 passes.
+   are absent from the repo (`git grep`). **Run the SMS deploy smoke (TC-057):** on a real US handset,
+   using a **fresh registration per probe send** (at-most-one result-SMS per registration) — **HELP
+   first** (an opted-out number may not receive the HELP reply), then send a live result-SMS (accepted
+   2xx + arrives), then STOP → next send blocked, then START → delivery restored — to confirm Advanced
+   Opt-Out is enabled. Do not declare SMS deployable until TC-057 passes.
 8. **Phase 12 (later):** print real owner + grouped pet labels on the 3nStar PPT305BT (TC-040) and
    lock `ANIMALS_PER_LABEL`.

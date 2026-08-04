@@ -17,7 +17,7 @@ source .venv/bin/activate
 pip install -r requirements/dev.txt   # already done
 cp .env.example .env                  # defaults work as-is; edit if you like
 python manage.py migrate
-python manage.py createsuperuser      # your first admin login
+python manage.py createsuperuser      # your first Admin (superuser + role=admin)
 ```
 
 ## Everyday commands
@@ -31,7 +31,7 @@ python manage.py createsuperuser      # your first admin login
 | Apply migrations | `python manage.py migrate` |
 | Make migrations after model changes | `python manage.py makemigrations` |
 | Django shell | `python manage.py shell` |
-| Admin account | `python manage.py createsuperuser` |
+| Admin account | `python manage.py createsuperuser` (creates a full Admin: `is_staff` + `is_superuser` + `role=admin`) |
 | System check | `python manage.py check` |
 | Collect static (mirrors the Render build) | `python manage.py collectstatic --noinput` |
 | Show migrations | `python manage.py showmigrations` |
