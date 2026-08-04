@@ -115,7 +115,7 @@ class Event(models.Model):
     # signup_open() also requires it to be None as defense-in-depth (FR-4).
     lottery_run_at = models.DateTimeField(null=True, blank=True, editable=False)
     # Per-event counter for staff walk-in/admit IDs (>= 1000). Incremented under
-    # the Event-row lock by Registration.allocate_staff_animal_id. These IDs are
+    # the Event-row lock by Registration.assign_next_walkin_id. These IDs are
     # NOT counted toward X/Y.
     next_staff_id = models.PositiveIntegerField(default=1000, editable=False)
 

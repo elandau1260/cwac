@@ -5,7 +5,10 @@ as UTC (``USE_TZ=True``) but the admin enters and reads them in the **event's
 own timezone**, so the admin always works in local wall-clock time for that
 clinic. A naive local input from the split-datetime widget is localized to the
 selected timezone on save; on load the stored UTC value is shown in local time.
+Wall times that do not exist (the spring-forward gap) or that exist twice (the
+fall-back fold) are rejected with a validation error.
 """
+import datetime
 import zoneinfo
 
 from django import forms
@@ -17,6 +20,35 @@ from .models import Event
 #: Fallback timezone for a brand-new event whose timezone field hasn't been
 #: chosen yet (matches the model default).
 DEFAULT_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+
+def _classify_local_time(naive, tz):
+    """Classify a naive local wall time in ``tz``.
+
+    Returns ``"nonexistent"`` for a time inside a spring-forward gap, or
+    ``"ambiguous"`` for a time inside a fall-back fold (where the same wall
+    time occurs twice). Returns ``None`` for an ordinary, unambiguous time.
+
+    The detection is stdlib-``zoneinfo`` only and avoids the ``datetime``
+    equality fast path (two aware datetimes that share a ``tzinfo`` compare
+    equal by wall time and ignore ``fold``), so it compares UTC offsets /
+    round-trips the instant instead:
+
+    * nonexistent — localizing then converting back through UTC lands on a
+      *different* wall time (the gap has no valid instant);
+    * ambiguous — the two ``fold`` values resolve to different UTC offsets
+      (the wall time maps to two distinct instants).
+    """
+    a = naive.replace(tzinfo=tz, fold=0)
+    b = naive.replace(tzinfo=tz, fold=1)
+    roundtripped = a.astimezone(datetime.timezone.utc).astimezone(tz).replace(
+        tzinfo=None
+    )
+    if roundtripped != naive:
+        return "nonexistent"
+    if a.utcoffset() != b.utcoffset():
+        return "ambiguous"
+    return None
 
 
 class EventAdminForm(forms.ModelForm):
@@ -67,6 +99,22 @@ class EventAdminForm(forms.ModelForm):
             # zone; we want it interpreted in the event's own timezone, so take
             # the naive wall-clock value and localize it to ``tz``.
             naive = value.replace(tzinfo=None) if timezone.is_aware(value) else value
+            kind = _classify_local_time(naive, tz)
+            if kind == "nonexistent":
+                self.add_error(
+                    name,
+                    f"That local time does not exist in {tz} (it falls in the "
+                    "spring-forward DST gap). Pick a different open/close time.",
+                )
+                continue
+            if kind == "ambiguous":
+                self.add_error(
+                    name,
+                    f"That local time is ambiguous in {tz} (it occurs twice "
+                    "during the fall-back DST fold). Pick a different open/close "
+                    "time.",
+                )
+                continue
             cleaned_data[name] = timezone.make_aware(naive, tz)
 
         open_at = cleaned_data.get("open_at")

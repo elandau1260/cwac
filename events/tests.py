@@ -356,3 +356,53 @@ class EventAdminFormTimezoneTest(TestCase):
         # Naive local wall-clock times (what the admin sees/edits).
         self.assertEqual(form.initial["open_at"], datetime.datetime(2026, 8, 10, 9, 0))
         self.assertEqual(form.initial["close_at"], datetime.datetime(2026, 8, 10, 17, 0))
+
+
+class EventAdminFormDstBoundaryTest(TestCase):
+    """DST-edge local times are rejected with a form error, never silently
+    mis-stored (finding 3: the spring-forward gap and the fall-back fold)."""
+
+    _base = dict(
+        slug="dst-event",
+        name="DST Clinic",
+        date="2026-03-08",
+        timezone="America/Los_Angeles",
+        x_seen="10",
+        y_waitlist="5",
+        z_applicants="50",
+    )
+
+    def test_nonexistent_spring_forward_time_rejected(self):
+        # 2026-03-08 02:30 America/Los_Angeles does not exist: clocks jump
+        # 02:00 -> 03:00. It must be rejected rather than stored as 03:30.
+        data = dict(
+            self._base,
+            open_at="2026-03-08 02:30",
+            close_at="2026-03-08 10:00",
+        )
+        form = EventAdminForm(data=data)
+        self.assertFalse(form.is_valid(), form.errors)
+        self.assertIn("open_at", form.errors)
+
+    def test_ambiguous_fall_back_time_rejected(self):
+        # 2026-11-01 01:30 America/Los_Angeles occurs twice (fall-back fold),
+        # so the wall time is ambiguous; reject it.
+        data = dict(
+            self._base,
+            date="2026-11-01",
+            open_at="2026-11-01 01:30",
+            close_at="2026-11-01 10:00",
+        )
+        form = EventAdminForm(data=data)
+        self.assertFalse(form.is_valid(), form.errors)
+        self.assertIn("open_at", form.errors)
+
+    def test_valid_time_just_after_the_gap_accepted(self):
+        # 2026-03-08 03:30 is past the spring-forward jump and is ordinary.
+        data = dict(
+            self._base,
+            open_at="2026-03-08 03:30",
+            close_at="2026-03-08 10:00",
+        )
+        form = EventAdminForm(data=data)
+        self.assertTrue(form.is_valid(), form.errors)

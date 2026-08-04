@@ -3,7 +3,7 @@
 Covers:
 - TC-009: no 'weight' field on Animal; per-animal fields present.
 - TC-014/015 (model layer): next_animal_id (1..999 only, ignores 1000+ staff IDs)
-  and allocate_staff_animal_id (>=1000 sequence, counter increment).
+  and assign_next_walkin_id (>=1000 sequence, counter increment).
 - Registration.clean() range<->id_source cross-check.
 - Partial unique index: (event, animal_id) unique when not null; multiple NULLs
   allowed; same ID across different events allowed.
@@ -72,8 +72,24 @@ class AnimalFieldsTest(TestCase):
             self.assertIn(expected, names)
 
     def test_sex_choices_match_export_spec(self):
+        # Decision 17: "Unknown" (U) is a first-class choice alongside the
+        # export-spec M/F/MN/FS values; the field itself is optional.
         choices = {value for value, _label in Animal.Sex.choices}
-        self.assertEqual(choices, {"M", "F", "MN", "FS"})
+        self.assertEqual(choices, {"M", "F", "MN", "FS", "U"})
+
+    def test_required_vs_optional_fields(self):
+        """TC-009 (revised, Decision 17): name/species/age are required; sex,
+        breed, and color are optional (blank allowed; sex unknown e.g. for
+        baby animals). No weight field."""
+        fields = {f.name: f for f in Animal._meta.get_fields()}
+        for required in ("name", "species", "age"):
+            self.assertFalse(
+                fields[required].blank, f"{required!r} must be required (blank=False)"
+            )
+        for optional in ("sex", "breed", "color", "medical_concern"):
+            self.assertTrue(
+                fields[optional].blank, f"{optional!r} must be optional (blank=True)"
+            )
 
 
 class RegistrationDefaultsTest(TestCase):
@@ -161,27 +177,27 @@ class RegistrationNextAnimalIdTest(TestCase):
         self.assertEqual(Registration.next_animal_id(e), 1000)
 
 
-class RegistrationAllocateStaffAnimalIdTest(TestCase):
+class RegistrationAssignNextWalkinIdTest(TestCase):
     """Staff IDs come from Event.next_staff_id (>=1000), atomic & monotonic."""
 
     def test_assigns_first_staff_id(self):
         e = make_event()
         r = make_registration(e)
-        Registration.allocate_staff_animal_id(e, r)
+        Registration.assign_next_walkin_id(e, r)
         self.assertEqual(r.animal_id, 1000)
         self.assertEqual(r.id_source, Registration.IdSource.STAFF)
 
     def test_increments_counter_on_event(self):
         e = make_event()
         r = make_registration(e)
-        Registration.allocate_staff_animal_id(e, r)
+        Registration.assign_next_walkin_id(e, r)
         e.refresh_from_db()
         self.assertEqual(e.next_staff_id, 1001)
 
     def test_passed_event_instance_reflects_new_counter(self):
         e = make_event()
         r = make_registration(e)
-        Registration.allocate_staff_animal_id(e, r)
+        Registration.assign_next_walkin_id(e, r)
         self.assertEqual(e.next_staff_id, 1001)
 
     def test_sequence_is_monotonic_and_unique(self):
@@ -190,16 +206,66 @@ class RegistrationAllocateStaffAnimalIdTest(TestCase):
         r2 = make_registration(e)
         r3 = make_registration(e)
         for r in (r1, r2, r3):
-            Registration.allocate_staff_animal_id(e, r)
+            Registration.assign_next_walkin_id(e, r)
         ids = {r1.animal_id, r2.animal_id, r3.animal_id}
         self.assertEqual(ids, {1000, 1001, 1002})
 
     def test_staff_id_not_in_lottery_range(self):
         e = make_event()
         r = make_registration(e)
-        Registration.allocate_staff_animal_id(e, r)
+        Registration.assign_next_walkin_id(e, r)
         # Staff IDs do not inflate the lottery sequence.
         self.assertEqual(Registration.next_animal_id(e), 1)
+
+    def test_rejects_registration_from_a_different_event(self):
+        # Cross-event misuse: a registration that belongs to another event
+        # must NOT consume this event's counter (FR-14/FR-37).
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e2)  # belongs to e2
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e1, r)
+        # Neither the registration nor the wrong event's counter advanced.
+        r.refresh_from_db()
+        self.assertIsNone(r.animal_id)
+        self.assertIsNone(r.id_source)
+        e1.refresh_from_db()
+        self.assertEqual(e1.next_staff_id, 1000)
+
+    def test_rejects_already_numbered_registration(self):
+        # An already-numbered row is never edited: a second admit must fail
+        # rather than overwrite the assigned ID (FR-14/FR-37/TC-045).
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)  # r -> 1000
+        self.assertEqual(r.animal_id, 1000)
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e, r)
+        # The original ID is unchanged; the counter did not advance again.
+        r.refresh_from_db()
+        self.assertEqual(r.animal_id, 1000)
+        e.refresh_from_db()
+        self.assertEqual(e.next_staff_id, 1001)
+
+    def test_rejects_unsaved_registration(self):
+        e = make_event()
+        r = Registration(  # unsaved
+            event=e, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e, r)
+        e.refresh_from_db()
+        self.assertEqual(e.next_staff_id, 1000)  # counter untouched
+
+    def test_reflects_assigned_id_and_source_on_caller_instance(self):
+        # The caller's (stale) instance is updated from the committed row, not
+        # a stale in-memory value.
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        self.assertEqual(r.animal_id, 1000)
+        self.assertEqual(r.id_source, Registration.IdSource.STAFF)
 
 
 class RegistrationEditTokenTest(TestCase):

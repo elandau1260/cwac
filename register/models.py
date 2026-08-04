@@ -96,7 +96,7 @@ class Registration(models.Model):
 
     # --- AnimalID (allocation-managed; read-only outside the allocators) ----
     # Lottery assigns 1..999; staff walk-in/admit assigns >=1000. Never typed
-    # or edited by hand — set only by next_animal_id() / allocate_staff_animal_id().
+    # or edited by hand — set only by next_animal_id() / assign_next_walkin_id().
     animal_id = models.PositiveIntegerField(
         null=True,
         blank=True,
@@ -236,32 +236,72 @@ class Registration(models.Model):
         return (agg["max_id"] or 0) + 1
 
     @classmethod
-    def allocate_staff_animal_id(cls, event, registration):
-        """Assign the next **staff** ID (>=1000) to ``registration``.
+    def assign_next_walkin_id(cls, event, registration):
+        """Assign the next **walk-in ID** (>=1000; the ``id_source='staff'``
+        range) to ``registration``.
 
-        Runs under ``transaction.atomic()`` with the **Event row locked and
-        reloaded** (``select_for_update``), so concurrent walk-in/admit calls
-        cannot race on ``next_staff_id`` and a deleted highest ID is never
-        reused (no ``max()+1``). Sets ``animal_id`` + ``id_source='staff'`` and
-        saves both the event counter and the registration. The caller (walk-in
-        add / admit, Phase 10) additionally sets ``status='selected'``.
+        Runs under ``transaction.atomic()`` with the **Event row and the
+        Registration row both locked and reloaded** (``select_for_update``,
+        locking the Event first then the Registration — one consistent order
+        across every caller, so it cannot deadlock with itself). This makes
+        the assignment safe against three failure modes (FR-14/FR-37/TC-045):
+
+        * **cross-event misuse** — ``registration`` belongs to a different
+          event than ``event`` — is rejected, so one event's counter is never
+          consumed while numbering a row in another event;
+        * **a duplicate/second admit of the same row** — the reloaded row
+          already has an ``animal_id`` — is rejected, so an assigned ID is
+          never overwritten with the next value (concurrent admits serialize
+          on the Registration lock; the second sees the committed ID);
+        * **counter races** — concurrent walk-in/admit calls serialize on the
+          Event lock, and a deleted highest ID is never reused (no
+          ``max()+1``).
+
+        Sets ``animal_id`` + ``id_source='staff'`` and saves both the event
+        counter and the registration. The caller (walk-in add / admit, Phase
+        10) additionally sets ``status='selected'``.
+
+        Raises ``ValueError`` for an unsaved event/registration, a
+        registration from another event, or a registration that is already
+        numbered (already-numbered IDs are never edited).
         """
         if event.pk is None:
             raise ValueError("Cannot allocate a staff ID against an unsaved event")
+        if registration.pk is None:
+            raise ValueError("Cannot allocate a staff ID against an unsaved registration")
 
         with transaction.atomic():
-            # Lock + reload the Event row through its own manager (avoids a
-            # circular import of events.models at module load time).
+            # Lock Event first, then Registration (consistent order -> no
+            # self-deadlock). Lock through each model's own manager to avoid a
+            # circular import of events.models at module load time.
             locked_event = (
                 type(event).objects.select_for_update().get(pk=event.pk)
             )
+            locked_reg = cls.objects.select_for_update().get(pk=registration.pk)
+
+            # Reject cross-event misuse on the authoritative (locked) row.
+            if locked_reg.event_id != locked_event.pk:
+                raise ValueError(
+                    "Cannot allocate a staff ID: the registration belongs to a "
+                    "different event."
+                )
+            # Already-numbered rows are never edited: a duplicate/second admit
+            # must fail rather than overwrite the assigned ID.
+            if locked_reg.animal_id is not None:
+                raise ValueError(
+                    "Cannot allocate a staff ID: the registration already has "
+                    f"animal_id {locked_reg.animal_id}."
+                )
+
             next_id = locked_event.next_staff_id
-            registration.animal_id = next_id
-            registration.id_source = cls.IdSource.STAFF
+            locked_reg.animal_id = next_id
+            locked_reg.id_source = cls.IdSource.STAFF
             locked_event.next_staff_id = next_id + 1
             locked_event.save(update_fields=["next_staff_id"])
-            registration.save()
-            # Reflect the incremented counter on the passed-in instance.
+            locked_reg.save()
+            # Reflect the committed state on the caller's instances.
+            registration.animal_id = locked_reg.animal_id
+            registration.id_source = locked_reg.id_source
             event.next_staff_id = locked_event.next_staff_id
         return registration
 
@@ -274,6 +314,7 @@ class Animal(models.Model):
         FEMALE = "F", "Female"
         MALE_NEUTERED = "MN", "Male-Neutered"
         FEMALE_SPAYED = "FS", "Female-Spayed"
+        UNKNOWN = "U", "Unknown"
 
     registration = models.ForeignKey(
         Registration, related_name="animals", on_delete=models.CASCADE,
@@ -285,6 +326,8 @@ class Animal(models.Model):
     )
     breed = models.CharField(max_length=100, blank=True, default="")
     color = models.CharField(max_length=100, blank=True, default="")
+    # sex is OPTIONAL (Decision 17): some animals' sex is unknown — especially
+    # babies — so the field may be left blank or set to "Unknown" (U).
     sex = models.CharField(
         max_length=2, choices=Sex.choices, blank=True, default="",
     )
