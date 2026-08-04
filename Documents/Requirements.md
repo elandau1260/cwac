@@ -132,7 +132,7 @@ AnimalID, edits as needed, and **prints labels**.
 |---|---|
 | `registration` | FK |
 | `name`, `species`, `age`, `breed`, `color` | |
-| `sex` | Male (M) / Female (F) / Male-Neutered (MN) / Female-Spayed (FS) |
+| `sex` | Male (M) / Female (F) / Male-Neutered (MN) / Female-Spayed (FS) / **Unknown (U)** — **optional** (Decision 17: sex is not required; some animals' sex is unknown, especially babies) |
 | `services_requested` | Flags for each service the event offers |
 | `last_vaccinated_date` | Asked if vaccination offered |
 | `medical_concern` | Free text, asked if vet offered |
@@ -260,7 +260,8 @@ loads. Volunteer can:
 Admin downloads all registrations for an event as **Excel/CSV** (columns: owner name, phone,
 address, email; per animal: name, species, age, sex, breed, color, services; plus status,
 AnimalID, language, and `printed`). The Admin uses this offline to cross-reference vaccines due in
-PetPoint.
+PetPoint. (`sex` is optional — blank or "Unknown" where the owner/staff did not know it, e.g. for
+baby animals; Decision 17.)
 
 ---
 
@@ -275,8 +276,9 @@ backend**, and printing now writes `printed_at` on the registration.
 Label content:
 - **Owner label** (one per registration): Owner Name, Phone, Email, Address
 - **Pet labels:** animals are **grouped onto labels** — target ~3 animals per label (Species, Name,
-  Age, Sex, Breed, Color each). The exact count per label will be set after **print testing** on
-  the 3nStar; this is not one-label-per-animal.
+  Age, Sex, Breed, Color each). `Sex` may be blank/"Unknown" where not known (Decision 17). The
+  exact count per label will be set after **print testing** on the 3nStar; this is not
+  one-label-per-animal.
 
 V1 default is **~3 animals per pet label**, adjustable based on what actually fits legibly.
 
@@ -383,7 +385,7 @@ Referenced by `Architecture.md` and `TraceabilityMatrix.md`.
 - **FR-5** Public form accessible via the event URL/QR (during the open window).
 - **FR-6** EN/ES language toggle on the public form.
 - **FR-7** Owner submits owner info — first/last name, phone, email, address (**all required**) — + animals.
-- **FR-8** Per-animal data: name, species, age, sex (**M/F/MN/FS** — Male / Female / Male-Neutered / Female-Spayed; matches the export spec), breed, color; **no weight**.
+- **FR-8** Per-animal data: **name, species, age (required)**; **sex, breed, color (optional)** — sex is **M/F/MN/FS/U** (Male / Female / Male-Neutered / Female-Spayed / **Unknown**; matches the export spec) and may be left blank or set to Unknown, because some animals' sex is not known — especially babies (Decision 17); **no weight**.
 - **FR-9** Per-animal services + questions built dynamically from `event.services_offered`.
 - **FR-10** Max **6 animals** per registration enforced during the open window.
 - **FR-11** Confirmation screen on submit (received; SMS to follow; no guaranteed time).

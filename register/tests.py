@@ -1,3 +1,469 @@
-from django.test import TestCase
+"""Phase 1 model tests for Registration and Animal.
 
-# Create your tests here.
+Covers:
+- TC-009: no 'weight' field on Animal; per-animal fields present.
+- TC-014/015 (model layer): next_animal_id (1..999 only, ignores 1000+ staff IDs)
+  and assign_next_walkin_id (>=1000 sequence, counter increment).
+- Registration.clean() range<->id_source cross-check.
+- Partial unique index: (event, animal_id) unique when not null; multiple NULLs
+  allowed; same ID across different events allowed.
+- Defaults, edit_token uniqueness, is_attended.
+"""
+import zoneinfo
+from datetime import timedelta
+
+from django.contrib import admin
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
+from django.test import TestCase
+from django.utils import timezone
+
+from events.models import Event
+from register.admin import RegistrationAdmin
+from register.models import (
+    Animal,
+    Registration,
+    generate_edit_token,
+)
+
+
+def make_event(**overrides):
+    now = timezone.now()
+    defaults = dict(
+        slug="test-event",
+        name="Test Clinic",
+        date=now.date(),
+        timezone=zoneinfo.ZoneInfo("America/Los_Angeles"),
+        open_at=now - timedelta(hours=1),
+        close_at=now + timedelta(hours=1),
+        x_seen=10,
+        y_waitlist=5,
+        z_applicants=50,
+    )
+    defaults.update(overrides)
+    return Event.objects.create(**defaults)
+
+
+def make_registration(event, **overrides):
+    defaults = dict(
+        event=event,
+        first_name="Ada",
+        last_name="Lovelace",
+        phone="+15105550100",
+        email="ada@example.com",
+        address="1 Clinic St",
+    )
+    defaults.update(overrides)
+    return Registration.objects.create(**defaults)
+
+
+class AnimalFieldsTest(TestCase):
+    """TC-009: per-animal fields, and NO weight field anywhere."""
+
+    def test_has_no_weight_field(self):
+        names = {f.name for f in Animal._meta.get_fields()}
+        self.assertNotIn("weight", names)
+
+    def test_has_expected_fields(self):
+        names = {f.name for f in Animal._meta.get_fields()}
+        for expected in (
+            "name", "species", "age", "breed", "color", "sex",
+            "services_requested", "last_vaccinated_date", "medical_concern",
+            "registration",
+        ):
+            self.assertIn(expected, names)
+
+    def test_sex_choices_match_export_spec(self):
+        # Decision 17: "Unknown" (U) is a first-class choice alongside the
+        # export-spec M/F/MN/FS values; the field itself is optional.
+        choices = {value for value, _label in Animal.Sex.choices}
+        self.assertEqual(choices, {"M", "F", "MN", "FS", "U"})
+
+    def test_required_vs_optional_fields(self):
+        """TC-009 (revised, Decision 17): name/species/age are required; sex,
+        breed, and color are optional (blank allowed; sex unknown e.g. for
+        baby animals). No weight field."""
+        fields = {f.name: f for f in Animal._meta.get_fields()}
+        for required in ("name", "species", "age"):
+            self.assertFalse(
+                fields[required].blank, f"{required!r} must be required (blank=False)"
+            )
+        for optional in ("sex", "breed", "color", "medical_concern"):
+            self.assertTrue(
+                fields[optional].blank, f"{optional!r} must be optional (blank=True)"
+            )
+
+
+class RegistrationDefaultsTest(TestCase):
+    def test_defaults_for_a_public_signup(self):
+        r = make_registration(make_event())
+        self.assertEqual(r.status, Registration.Status.REGISTERED)
+        self.assertEqual(r.language, Registration.Language.ENGLISH)
+        self.assertEqual(r.creation_source, Registration.CreationSource.PUBLIC)
+        self.assertFalse(r.sms_opt_out)
+        self.assertIsNone(r.animal_id)
+        self.assertIsNone(r.id_source)
+        self.assertIsNone(r.result_sms_state)
+        self.assertFalse(r.is_attended)
+
+    def test_next_staff_id_defaults_to_1000(self):
+        e = make_event()
+        self.assertEqual(e.next_staff_id, 1000)
+
+
+class RegistrationCleanTest(TestCase):
+    """clean() cross-checks animal_id range against id_source."""
+
+    def _build(self, event=None, **overrides):
+        defaults = dict(
+            event=event or make_event(),
+            first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        defaults.update(overrides)
+        return Registration(**defaults)  # unsaved -> clean() in isolation
+
+    def test_lottery_id_in_range_ok(self):
+        e = make_event()
+        self._build(e, animal_id=1, id_source="lottery").full_clean()
+        self._build(e, animal_id=999, id_source="lottery").full_clean()
+
+    def test_lottery_id_above_999_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(animal_id=1000, id_source="lottery").full_clean()
+
+    def test_staff_id_ok(self):
+        e = make_event()
+        self._build(e, animal_id=1000, id_source="staff").full_clean()
+        self._build(e, animal_id=1234, id_source="staff").full_clean()
+
+    def test_staff_id_below_1000_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(animal_id=500, id_source="staff").full_clean()
+
+    def test_id_without_source_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(animal_id=5).full_clean()
+
+    def test_source_without_id_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(id_source="lottery").full_clean()
+
+    def test_no_id_no_source_ok(self):
+        self._build().full_clean()
+
+
+class RegistrationNextAnimalIdTest(TestCase):
+    """Lottery sequence = max(1..999 IDs)+1, ignoring staff IDs (>=1000)."""
+
+    def test_empty_event_returns_1(self):
+        self.assertEqual(Registration.next_animal_id(make_event()), 1)
+
+    def test_ignores_staff_ids(self):
+        e = make_event()
+        make_registration(e, animal_id=1000, id_source="staff")
+        make_registration(e, animal_id=1042, id_source="staff")
+        self.assertEqual(Registration.next_animal_id(e), 1)
+
+    def test_max_lottery_id_plus_one(self):
+        e = make_event()
+        make_registration(e, animal_id=5, id_source="lottery")
+        make_registration(e, animal_id=1000, id_source="staff")  # ignored
+        self.assertEqual(Registration.next_animal_id(e), 6)
+
+    def test_boundary_at_999(self):
+        # next_animal_id reports the next number; the lottery (Phase 5) guards
+        # the >999 case. Here it simply returns 1000 once 999 is taken.
+        e = make_event()
+        make_registration(e, animal_id=999, id_source="lottery")
+        self.assertEqual(Registration.next_animal_id(e), 1000)
+
+
+class RegistrationAssignNextWalkinIdTest(TestCase):
+    """Staff IDs come from Event.next_staff_id (>=1000), atomic & monotonic."""
+
+    def test_assigns_first_staff_id(self):
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        self.assertEqual(r.animal_id, 1000)
+        self.assertEqual(r.id_source, Registration.IdSource.STAFF)
+
+    def test_increments_counter_on_event(self):
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        e.refresh_from_db()
+        self.assertEqual(e.next_staff_id, 1001)
+
+    def test_passed_event_instance_reflects_new_counter(self):
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        self.assertEqual(e.next_staff_id, 1001)
+
+    def test_sequence_is_monotonic_and_unique(self):
+        e = make_event()
+        r1 = make_registration(e)
+        r2 = make_registration(e)
+        r3 = make_registration(e)
+        for r in (r1, r2, r3):
+            Registration.assign_next_walkin_id(e, r)
+        ids = {r1.animal_id, r2.animal_id, r3.animal_id}
+        self.assertEqual(ids, {1000, 1001, 1002})
+
+    def test_staff_id_not_in_lottery_range(self):
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        # Staff IDs do not inflate the lottery sequence.
+        self.assertEqual(Registration.next_animal_id(e), 1)
+
+    def test_rejects_registration_from_a_different_event(self):
+        # Cross-event misuse: a registration that belongs to another event
+        # must NOT consume this event's counter (FR-14/FR-37).
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e2)  # belongs to e2
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e1, r)
+        # Neither the registration nor the wrong event's counter advanced.
+        r.refresh_from_db()
+        self.assertIsNone(r.animal_id)
+        self.assertIsNone(r.id_source)
+        e1.refresh_from_db()
+        self.assertEqual(e1.next_staff_id, 1000)
+
+    def test_rejects_already_numbered_registration(self):
+        # An already-numbered row is never edited: a second admit must fail
+        # rather than overwrite the assigned ID (FR-14/FR-37/TC-045).
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)  # r -> 1000
+        self.assertEqual(r.animal_id, 1000)
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e, r)
+        # The original ID is unchanged; the counter did not advance again.
+        r.refresh_from_db()
+        self.assertEqual(r.animal_id, 1000)
+        e.refresh_from_db()
+        self.assertEqual(e.next_staff_id, 1001)
+
+    def test_rejects_unsaved_registration(self):
+        e = make_event()
+        r = Registration(  # unsaved
+            event=e, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        with self.assertRaises(ValueError):
+            Registration.assign_next_walkin_id(e, r)
+        e.refresh_from_db()
+        self.assertEqual(e.next_staff_id, 1000)  # counter untouched
+
+    def test_reflects_assigned_id_and_source_on_caller_instance(self):
+        # The caller's (stale) instance is updated from the committed row, not
+        # a stale in-memory value.
+        e = make_event()
+        r = make_registration(e)
+        Registration.assign_next_walkin_id(e, r)
+        self.assertEqual(r.animal_id, 1000)
+        self.assertEqual(r.id_source, Registration.IdSource.STAFF)
+
+
+class RegistrationEditTokenTest(TestCase):
+    def test_generate_edit_token_is_random_per_call(self):
+        tokens = {generate_edit_token() for _ in range(50)}
+        self.assertEqual(len(tokens), 50)
+
+    def test_each_registration_gets_a_distinct_token(self):
+        e = make_event()
+        r1 = make_registration(e)
+        r2 = make_registration(e)
+        self.assertTrue(r1.edit_token)
+        self.assertNotEqual(r1.edit_token, r2.edit_token)
+
+    def test_edit_token_unique_constraint(self):
+        e = make_event()
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Registration.objects.create(
+                    event=e, first_name="A", last_name="B", phone="+1",
+                    email="a@b.com", address="x", edit_token="same-token",
+                )
+                Registration.objects.create(
+                    event=e, first_name="C", last_name="D", phone="+2",
+                    email="c@d.com", address="y", edit_token="same-token",
+                )
+
+
+class RegistrationIsAttendedTest(TestCase):
+    def test_not_attended_until_printed(self):
+        r = make_registration(make_event())
+        self.assertFalse(r.is_attended)
+
+    def test_attended_after_printed(self):
+        r = make_registration(make_event())
+        r.printed_at = timezone.now()
+        r.save(update_fields=["printed_at"])
+        self.assertTrue(r.is_attended)
+
+
+class RegistrationPartialUniqueIndexTest(TestCase):
+    def test_duplicate_event_animal_id_rejected(self):
+        e = make_event()
+        make_registration(e, animal_id=7, id_source="lottery")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_registration(e, animal_id=7, id_source="lottery")
+
+    def test_multiple_null_animal_ids_allowed(self):
+        e = make_event()
+        make_registration(e)
+        make_registration(e)  # both animal_id NULL -> allowed
+        self.assertEqual(Registration.objects.filter(event=e).count(), 2)
+
+    def test_same_id_in_different_events_allowed(self):
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        make_registration(e1, animal_id=7, id_source="lottery")
+        make_registration(e2, animal_id=7, id_source="lottery")  # OK
+        self.assertEqual(Registration.objects.filter(animal_id=7).count(), 2)
+
+
+class RegistrationIdRangeSourceConstraintTest(TestCase):
+    """Finding 2: the range<->source invariant is DB-enforced, so it holds even
+    when clean()/full_clean() is bypassed (save/create/update)."""
+
+    def setUp(self):
+        self.event = make_event()
+
+    def _create(self, **overrides):
+        defaults = dict(
+            event=self.event, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        defaults.update(overrides)
+        return Registration.objects.create(**defaults)
+
+    def test_null_id_null_source_ok(self):
+        self._create()  # pre-lottery row
+        self._create()  # multiple NULL pairs allowed
+
+    def test_lottery_in_range_ok(self):
+        self._create(animal_id=1, id_source="lottery")
+        self._create(animal_id=999, id_source="lottery")
+
+    def test_staff_in_range_ok(self):
+        self._create(animal_id=1000, id_source="staff")
+        self._create(animal_id=5000, id_source="staff")
+
+    def test_lottery_id_above_999_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=1000, id_source="lottery")
+
+    def test_staff_id_below_1000_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=7, id_source="staff")
+
+    def test_id_without_source_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=5, id_source=None)
+
+    def test_source_without_id_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=None, id_source="lottery")
+
+
+class RegistrationEventImmutabilityTest(TestCase):
+    """A persisted registration's event is immutable (FR-14/FR-37/TC-045).
+
+    Once a row exists for an event it is locked to that event — the Django admin
+    exposes ``event`` read-only on change forms and ``clean()``/``save()`` reject
+    any reassignment. This is what prevents a numbered row moved into a fresh
+    event from stranding that event's allocation sequence.
+    """
+
+    def test_save_rejects_event_change(self):
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        r.event = e2
+        with self.assertRaises(ValueError):
+            r.save()
+        # The DB row is unchanged.
+        r.refresh_from_db()
+        self.assertEqual(r.event_id, e1.pk)
+
+    def test_save_rejects_event_change_on_numbered_row(self):
+        # The audit scenario: a staff-numbered row cannot be reparented.
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        Registration.assign_next_walkin_id(e1, r)  # r -> 1000
+        r.event = e2
+        with self.assertRaises(ValueError):
+            r.save()
+        r.refresh_from_db()
+        self.assertEqual(r.event_id, e1.pk)
+        self.assertEqual(r.animal_id, 1000)
+
+    def test_clean_rejects_event_change(self):
+        # Friendly form-level guard (admin change forms call full_clean()).
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        r.event = e2
+        with self.assertRaises(ValidationError):
+            r.full_clean()
+
+    def test_create_can_choose_any_event(self):
+        # The guard only fires on updates; new rows freely select an event.
+        e = make_event()
+        r = Registration.objects.create(
+            event=e, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        self.assertEqual(r.event_id, e.pk)
+
+    def test_saving_other_fields_in_same_event_is_allowed(self):
+        # Updating unrelated fields on a row that stays in its event is fine.
+        e = make_event()
+        r = make_registration(e)
+        r.first_name = "Changed"
+        r.save(update_fields=["first_name"])
+        r.refresh_from_db()
+        self.assertEqual(r.first_name, "Changed")
+        self.assertEqual(r.event_id, e.pk)
+
+    def test_admin_change_form_marks_event_readonly(self):
+        # `event` is editable on add but read-only once the row exists, so the
+        # back-office cannot reparent a registration through the UI either.
+        site = admin.sites.AdminSite()
+        modeladmin = RegistrationAdmin(Registration, site)
+        self.assertNotIn(
+            "event", modeladmin.get_readonly_fields(request=None, obj=None)
+        )
+        r = make_registration(make_event())
+        self.assertIn("event", modeladmin.get_readonly_fields(request=None, obj=r))
+
+    def test_cannot_strand_another_events_counter(self):
+        # End-to-end guarantee from the audit: a numbered row moved into a fresh
+        # event B must NOT leave B's next_staff_id stranded below a moved ID.
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")  # next_staff_id defaults to 1000
+        r = make_registration(e1)
+        Registration.assign_next_walkin_id(e1, r)  # r -> 1000 (in e1)
+        r.event = e2  # attempt to reparent into e2
+        with self.assertRaises(ValueError):
+            r.save()
+        # e2's counter is untouched, and a legitimate walk-in in e2 still gets
+        # the correct first ID (not stranded above the moved row's ID).
+        e2.refresh_from_db()
+        self.assertEqual(e2.next_staff_id, 1000)
+        r2 = make_registration(e2)
+        Registration.assign_next_walkin_id(e2, r2)
+        self.assertEqual(r2.animal_id, 1000)

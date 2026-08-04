@@ -1,3 +1,419 @@
-from django.db import models
+"""Models for CWAC owner registrations and their animals.
 
-# Create your models here.
+A :class:`Registration` is one owner's entry into a clinic's pre-registration:
+their contact info, the lottery/clinic outcome, a 256-bit self-edit token, the
+fire-and-forget result-SMS state, and provenance (public owner vs. staff-added).
+
+:class:`Animal` belongs to a registration. There is deliberately **no** ``weight``
+field (FR-8/TC-009).
+
+AnimalID assignment is split into two non-overlapping ranges, DB-enforced:
+lottery assigns **1..999**; staff walk-in/admit assigns **>=1000** (a dedicated
+sequence on ``Event.next_staff_id``, not counted toward X/Y). The two ranges
+together cover every positive integer, so :meth:`Registration.clean` cross-checks
+the value against ``id_source`` to prove which allocator produced it.
+"""
+import secrets
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
+from django.db.models import Max
+
+#: Lottery AnimalIDs are drawn from this inclusive range (Decision 4).
+LOTTERY_ANIMAL_ID_MIN = 1
+LOTTERY_ANIMAL_ID_MAX = 999
+#: Staff walk-in/admit IDs start at 1000 and count up (not toward X/Y).
+STAFF_ANIMAL_ID_MIN = 1000
+
+
+def generate_edit_token():
+    """A fresh 256-bit URL-safe token per registration row.
+
+    A bare ``default=secrets.token_urlsafe`` would be evaluated once at import
+    time and reuse one token (collision); this module-level callable is invoked
+    per row, so each registration gets its own secret — the only auth for
+    self-edit (FR-20).
+    """
+    return secrets.token_urlsafe(32)
+
+
+class Registration(models.Model):
+    """One owner's pre-registration for a clinic."""
+
+    class Status(models.TextChoices):
+        REGISTERED = "registered", "Registered"
+        SELECTED = "selected", "Selected"
+        WAITLISTED = "waitlisted", "Waitlisted"
+        NOT_SELECTED = "not_selected", "Not selected"
+        CHECKED_IN = "checked_in", "Checked in"
+
+    class IdSource(models.TextChoices):
+        LOTTERY = "lottery", "Lottery"
+        STAFF = "staff", "Staff"
+
+    class Language(models.TextChoices):
+        ENGLISH = "en", "English"
+        SPANISH = "es", "Spanish"
+
+    class ResultSmsState(models.TextChoices):
+        # Fire-and-forget result-SMS state for admin/export (Phase 6). ``null``
+        # = no attempt; ``sending`` = claimed, in flight; ``sent`` = Twilio
+        # accepted (2xx); ``failed`` = synchronous 4xx; ``unknown`` = a *caught*
+        # ambiguous outcome (5xx/timeout/connection). A process crash is NOT
+        # ``unknown`` — it leaves ``null`` or a persistent ``sending``. Never
+        # retried; neither ``null`` nor ``sending`` is ever resent.
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Sent (accepted)"
+        FAILED = "failed", "Failed"
+        UNKNOWN = "unknown", "Unknown"
+
+    class CreationSource(models.TextChoices):
+        PUBLIC = "public", "Public (owner)"
+        STAFF = "staff", "Staff"
+
+    # --- Relationships ------------------------------------------------------
+    event = models.ForeignKey(
+        "events.Event", related_name="registrations", on_delete=models.CASCADE,
+    )
+    created_by_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="created_registrations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="The staff user that created a staff-source row (null for public).",
+    )
+    admitted_by_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="admitted_registrations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        editable=False,
+        help_text="The staff user that admitted an existing public row (1000+ ID).",
+    )
+
+    # --- AnimalID (allocation-managed; read-only outside the allocators) ----
+    # Lottery assigns 1..999; staff walk-in/admit assigns >=1000. Never typed
+    # or edited by hand — set only by next_animal_id() / assign_next_walkin_id().
+    animal_id = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text="Assigned by the lottery (1..999) or staff (>=1000); "
+        "read-only outside the allocation services.",
+    )
+    id_source = models.CharField(
+        max_length=10,
+        choices=IdSource.choices,
+        null=True,
+        blank=True,
+        editable=False,
+        help_text="Which allocator assigned animal_id (set together with it).",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.REGISTERED,
+    )
+    edit_token = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        default=generate_edit_token,
+    )
+    language = models.CharField(
+        max_length=2, choices=Language.choices, default=Language.ENGLISH,
+    )
+
+    # --- Clinic-day state ---------------------------------------------------
+    printed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    checked_in_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    # --- Fire-and-forget result-SMS state (Phase 6) -------------------------
+    result_sms_state = models.CharField(
+        max_length=10,
+        choices=ResultSmsState.choices,
+        null=True,
+        blank=True,
+        default=None,
+        editable=False,
+    )
+    result_sms_sent_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    # --- Application-level SMS consent (the only app-side SMS gate) ---------
+    # True => signup + result SMS are skipped; status still shows on the
+    # edit-link page (FR-42). Provider-side STOP/START is not mirrored.
+    sms_opt_out = models.BooleanField(default=False)
+
+    # --- Owner contact info (all required) ---------------------------------
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    phone = models.CharField(
+        max_length=20, help_text="E.164 (Phase 3 validates + normalizes)."
+    )
+    email = models.EmailField()
+    address = models.CharField(max_length=300)
+
+    # --- Provenance ---------------------------------------------------------
+    creation_source = models.CharField(
+        max_length=10,
+        choices=CreationSource.choices,
+        default=CreationSource.PUBLIC,
+    )
+    admitted_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["event", "last_name", "first_name"]
+        constraints = [
+            # Lottery/staff IDs are unique per event. Multiple NULLs are allowed
+            # (registrations before the lottery have no ID yet). This is the
+            # Postgres partial unique index from the plan; on SQLite it behaves
+            # the same way (NULLs excluded by the condition).
+            models.UniqueConstraint(
+                fields=["event", "animal_id"],
+                condition=models.Q(animal_id__isnull=False),
+                name="unique_animal_id_per_event",
+            ),
+            # DB-enforced range<->source invariant (Requirements §7.4: "The
+            # database enforces 1–999 (lottery) and >=1000 (staff)"). clean()
+            # gives friendly form errors, but save()/create()/update() bypass
+            # full_clean(), so this backstop rejects every invalid combination
+            # at the database: exactly (NULL, NULL), lottery 1..999, or staff
+            # >=1000. The explicit ``isnull`` guards are required so that a
+            # half-set row (id without source, or vice-versa) resolves to
+            # FALSE, not SQL NULL (which a CHECK constraint treats as a pass).
+            models.CheckConstraint(
+                condition=(
+                    models.Q(animal_id__isnull=True, id_source__isnull=True)
+                    | (
+                        models.Q(animal_id__isnull=False, id_source__isnull=False)
+                        & (
+                            models.Q(
+                                id_source="lottery",
+                                animal_id__gte=LOTTERY_ANIMAL_ID_MIN,
+                                animal_id__lte=LOTTERY_ANIMAL_ID_MAX,
+                            )
+                            | models.Q(
+                                id_source="staff",
+                                animal_id__gte=STAFF_ANIMAL_ID_MIN,
+                            )
+                        )
+                    )
+                ),
+                name="animal_id_source_range_valid",
+            ),
+        ]
+
+    def __str__(self):
+        tag = f"#{self.animal_id}" if self.animal_id else "—"
+        return f"{tag} {self.first_name} {self.last_name} ({self.event})"
+
+    def _db_event_id(self):
+        """The ``event_id`` currently persisted for this row, or ``None``.
+
+        ``None`` means the row isn't in the DB yet (unsaved) or was concurrently
+        deleted — in either case there is no prior event to be immutable from.
+        """
+        if self.pk is None:
+            return None
+        return (
+            type(self).objects.filter(pk=self.pk)
+            .values_list("event_id", flat=True)
+            .first()
+        )
+
+    def clean(self):
+        """Validate ``animal_id`` range↔source and event immutability.
+
+        Lottery ⇒ 1..999; staff ⇒ >=1000. Since ``1..999 ∪ >=1000`` covers every
+        positive integer, the range alone cannot prove the allocator, so both
+        must agree (the partial unique index guarantees event-uniqueness).
+
+        A persisted registration is also **locked to its event**: reparenting it
+        to another event would strand the destination event's ID sequence
+        (FR-14/FR-37/TC-045). The admin renders ``event`` read-only on change
+        forms; this is the friendly form-level guard, with :meth:`save` as the
+        backstop for every non-admin path.
+        """
+        super().clean()
+        original_event_id = self._db_event_id()
+        if original_event_id is not None and original_event_id != self.event_id:
+            raise ValidationError(
+                {"event": "A registration cannot be moved to another event."}
+            )
+        if self.animal_id is not None:
+            if self.id_source == self.IdSource.LOTTERY:
+                if not (LOTTERY_ANIMAL_ID_MIN <= self.animal_id <= LOTTERY_ANIMAL_ID_MAX):
+                    raise ValidationError(
+                        {"animal_id": "Lottery IDs must be in 1..999."}
+                    )
+            elif self.id_source == self.IdSource.STAFF:
+                if self.animal_id < STAFF_ANIMAL_ID_MIN:
+                    raise ValidationError(
+                        {"animal_id": "Staff IDs must be >= 1000."}
+                    )
+            elif self.id_source is None:
+                raise ValidationError(
+                    {"id_source": "An animal_id requires an id_source."}
+                )
+        elif self.id_source is not None:
+            raise ValidationError(
+                {"id_source": "id_source is set but animal_id is not."}
+            )
+
+    def save(self, *args, **kwargs):
+        """Persist, enforcing that a registration's ``event`` never changes.
+
+        Once a row exists, its event is **immutable** (FR-14/FR-37/TC-045): a
+        registration belongs to exactly one event for its entire lifetime.
+        Reparenting would strand the destination event's ID sequence — e.g. a
+        staff-numbered row (ID 1000) moved into a fresh event leaves that
+        event's ``next_staff_id`` at 1000, so every later walk-in collides on
+        ``unique_animal_id_per_event`` and rolls back. :meth:`clean` gives the
+        admin a friendly error, but ``save()``/``create()``/``update()`` bypass
+        ``full_clean()``, so this guard backstops every code path. To put an
+        owner in another event, add a new row there.
+        """
+        if not self._state.adding:
+            original_event_id = self._db_event_id()
+            if original_event_id is not None and original_event_id != self.event_id:
+                raise ValueError(
+                    "Cannot change a registration's event: a registration is "
+                    "locked to the event it was created for."
+                )
+        super().save(*args, **kwargs)
+
+    @property
+    def is_attended(self):
+        """Authoritative 'showed up' signal: printed (FR-35/TC-043)."""
+        return self.printed_at is not None
+
+    # --- Allocation services ------------------------------------------------
+    @classmethod
+    def next_animal_id(cls, event):
+        """Next lottery AnimalID = (max existing ID in the **1..999 lottery
+        range**) + 1, else 1.
+
+        Staff IDs (>=1000) are deliberately excluded so a staff-grown row can
+        never inflate the lottery sequence. Used by the lottery only (Phase 5).
+        """
+        agg = cls.objects.filter(
+            event=event,
+            animal_id__gte=LOTTERY_ANIMAL_ID_MIN,
+            animal_id__lte=LOTTERY_ANIMAL_ID_MAX,
+        ).aggregate(max_id=Max("animal_id"))
+        return (agg["max_id"] or 0) + 1
+
+    @classmethod
+    def assign_next_walkin_id(cls, event, registration):
+        """Assign the next **walk-in ID** (>=1000; the ``id_source='staff'``
+        range) to ``registration``.
+
+        Runs under ``transaction.atomic()`` with the **Event row and the
+        Registration row both locked and reloaded** (``select_for_update``,
+        locking the Event first then the Registration — one consistent order
+        across every caller, so it cannot deadlock with itself). This makes
+        the assignment safe against three failure modes (FR-14/FR-37/TC-045):
+
+        * **cross-event misuse** — ``registration`` belongs to a different
+          event than ``event`` — is rejected, so one event's counter is never
+          consumed while numbering a row in another event;
+        * **a duplicate/second admit of the same row** — the reloaded row
+          already has an ``animal_id`` — is rejected, so an assigned ID is
+          never overwritten with the next value (concurrent admits serialize
+          on the Registration lock; the second sees the committed ID);
+        * **counter races** — concurrent walk-in/admit calls serialize on the
+          Event lock, and a deleted highest ID is never reused (no
+          ``max()+1``).
+
+        Sets ``animal_id`` + ``id_source='staff'`` and saves both the event
+        counter and the registration. The caller (walk-in add / admit, Phase
+        10) additionally sets ``status='selected'``.
+
+        Raises ``ValueError`` for an unsaved event/registration, a
+        registration from another event, or a registration that is already
+        numbered (already-numbered IDs are never edited).
+        """
+        if event.pk is None:
+            raise ValueError("Cannot allocate a staff ID against an unsaved event")
+        if registration.pk is None:
+            raise ValueError("Cannot allocate a staff ID against an unsaved registration")
+
+        with transaction.atomic():
+            # Lock Event first, then Registration (consistent order -> no
+            # self-deadlock). Lock through each model's own manager to avoid a
+            # circular import of events.models at module load time.
+            locked_event = (
+                type(event).objects.select_for_update().get(pk=event.pk)
+            )
+            locked_reg = cls.objects.select_for_update().get(pk=registration.pk)
+
+            # Reject cross-event misuse on the authoritative (locked) row.
+            if locked_reg.event_id != locked_event.pk:
+                raise ValueError(
+                    "Cannot allocate a staff ID: the registration belongs to a "
+                    "different event."
+                )
+            # Already-numbered rows are never edited: a duplicate/second admit
+            # must fail rather than overwrite the assigned ID.
+            if locked_reg.animal_id is not None:
+                raise ValueError(
+                    "Cannot allocate a staff ID: the registration already has "
+                    f"animal_id {locked_reg.animal_id}."
+                )
+
+            next_id = locked_event.next_staff_id
+            locked_reg.animal_id = next_id
+            locked_reg.id_source = cls.IdSource.STAFF
+            locked_event.next_staff_id = next_id + 1
+            locked_event.save(update_fields=["next_staff_id"])
+            locked_reg.save()
+            # Reflect the committed state on the caller's instances.
+            registration.animal_id = locked_reg.animal_id
+            registration.id_source = locked_reg.id_source
+            event.next_staff_id = locked_event.next_staff_id
+        return registration
+
+
+class Animal(models.Model):
+    """One animal belonging to a registration."""
+
+    class Sex(models.TextChoices):
+        MALE = "M", "Male"
+        FEMALE = "F", "Female"
+        MALE_NEUTERED = "MN", "Male-Neutered"
+        FEMALE_SPAYED = "FS", "Female-Spayed"
+        UNKNOWN = "U", "Unknown"
+
+    registration = models.ForeignKey(
+        Registration, related_name="animals", on_delete=models.CASCADE,
+    )
+    name = models.CharField(max_length=100)
+    species = models.CharField(max_length=100)
+    age = models.CharField(
+        max_length=30, help_text="Free text, e.g. '3 years' or '8 months'."
+    )
+    breed = models.CharField(max_length=100, blank=True, default="")
+    color = models.CharField(max_length=100, blank=True, default="")
+    # sex is OPTIONAL (Decision 17): some animals' sex is unknown — especially
+    # babies — so the field may be left blank or set to "Unknown" (U).
+    sex = models.CharField(
+        max_length=2, choices=Sex.choices, blank=True, default="",
+    )
+    services_requested = models.JSONField(default=list)
+    last_vaccinated_date = models.DateField(null=True, blank=True)
+    medical_concern = models.TextField(blank=True, default="")
+    # NOTE: deliberately no ``weight`` field (FR-8/TC-009).
+
+    class Meta:
+        # Stable print grouping (labels group animals in id order).
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.species})" if self.name else self.species

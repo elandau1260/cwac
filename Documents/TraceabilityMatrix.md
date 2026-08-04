@@ -23,7 +23,7 @@ are in §2.
 | **FR-5** | Public form via event URL, no login | TC-005 |
 | **FR-6** | EN/ES language toggle | TC-006 |
 | **FR-7** | Owner info (all required) + ≥1 animal submitted | TC-007, TC-008, TC-051 |
-| **FR-8** | Per-animal fields; no weight | TC-009 |
+| **FR-8** | Per-animal fields (name/species/age required; sex/breed/color optional incl. "Unknown"); no weight | TC-009 |
 | **FR-9** | Per-animal services/questions from event config | TC-010 |
 | **FR-10** | Max 6 animals enforced on owner additions during open window (edit-form max tracks current count) | TC-008, TC-052 |
 | **FR-11** | Confirmation screen (no guaranteed time) | TC-011 |
@@ -77,7 +77,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-006 | E2E | Toggle to ES → every public label renders in Spanish; toggle back to EN. |
 | TC-007 | I | Submit with a missing required owner field (name/phone/email/address) → blocked with validation errors. |
 | TC-008 | I | Submit 7 animals → blocked at 6; submit 6 → accepted. |
-| TC-009 | I | Per-animal required fields enforced; no "weight" field present anywhere in the form or model. |
+| TC-009 | I | Per-animal required/optional fields enforced; no "weight" field present anywhere in the form or model. **Required:** name, species, age. **Optional (blank allowed):** breed, color, and sex — sex choices are M/F/MN/FS/U (Male/Female/Male-Neutered/Female-Spayed/**Unknown**); sex may be blank or "Unknown" because some animals' sex is not known, especially babies (Decision 17). |
 | TC-010 | E2E | Event offers only `vaccination`+`vet` → form shows only those service checkboxes + last-vaccinated + medical-concern; hides flea/microchip. |
 | TC-011 | E2E | Valid submission → confirmation screen appears and states no guaranteed time. |
 | TC-012 | U | **Per-bucket lottery bounds.** With seeded registrations/animal-counts, let **M_s** = the largest animal count among the selected-bucket's eligible regs and **M_w** = the largest among the waitlist bucket's remainder. If enough animals exist to reach a cap: selected sum ∈ [X, X+M_s), waitlist sum ∈ [Y, Y+M_w) — the waitlist is computed on the **remainder after the selected bucket's overshoot**. If not enough animals exist, that bucket takes all remaining and the total is **below** the cap. Cases: (a) empty event (0 regs) → no assignments, lottery still completes; (b) total animals < X → all selected (selected < X, waitlist empty); (c) total between X and ~X+Y → selected fills to X (overshoot), waitlist gets the remainder; (d) **X=0** → selected bucket skipped; (e) **Y=0** → waitlist bucket skipped. Include a staff-grown >6-animal reg (TC-052); assert the bound holds with M = that count (typical all-owner rows M=6 ⇒ < X+6 / < Y+6). |
@@ -112,8 +112,8 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 | TC-041 | I | After `close_at`: new signups rejected; an owner's add-animal is blocked (edit/remove still work); the admin can still add/edit. |
 | TC-042 | E2E | After `close_at`, the owner edit page shows no working add-animal control (remove/edit still function). |
 | TC-043 | I | Printing labels for a registration sets `printed_at`; the registration then reports as attended/printed in admin + export. |
-| TC-044 | I | **Walk-in add (staff, post-lottery).** Staff (admin or volunteer) add a walk-in registration (owner + animals) → saved with `creation_source=staff`, `created_by_user`=the actor; the 6-animal cap is not enforced; lookup-able by name/phone. The system **auto-assigns the next 1000+ ID** (`allocate_staff_animal_id`) and sets `status='selected'` atomically — the owner's status banner then shows the ID. **Rejected before the lottery has run.** The 1000+ ID is **not counted toward X/Y**. |
-| TC-045 | I | **Admit (staff, post-lottery).** Staff admit an existing `registered`/`not_selected` row → the system auto-assigns the next 1000+ ID (unique in event) and atomically sets `status='selected'`; provenance (`creation_source`/`created_by_user`) is **untouched** (`admitted_by_user`/`admitted_at` set); a duplicate ID is rejected; the entry is lookup-able by that ID; export reflects the admitted status. A `selected`/`waitlisted`/`checked_in` row **keeps its ID and status** (staff never edit an ID on a numbered row). **Pre-lottery walk-in/admit is rejected.** 1000+ IDs are not counted toward X/Y. |
+| TC-044 | I | **Walk-in add (staff, post-lottery).** Staff (admin or volunteer) add a walk-in registration (owner + animals) → saved with `creation_source=staff`, `created_by_user`=the actor; the 6-animal cap is not enforced; lookup-able by name/phone. The system **auto-assigns the next 1000+ ID** (`assign_next_walkin_id`) and sets `status='selected'` atomically — the owner's status banner then shows the ID. **Rejected before the lottery has run.** The 1000+ ID is **not counted toward X/Y**. |
+| TC-045 | I | **Admit (staff, post-lottery).** Staff admit an existing `registered`/`not_selected` row → the system auto-assigns the next 1000+ ID (unique in event) and atomically sets `status='selected'`; provenance (`creation_source`/`created_by_user`) is **untouched** (`admitted_by_user`/`admitted_at` set); a duplicate ID is rejected; the entry is lookup-able by that ID; export reflects the admitted status. A `selected`/`waitlisted`/`checked_in` row **keeps its ID and status** (staff never edit an ID on a numbered row). **Pre-lottery walk-in/admit is rejected.** 1000+ IDs are not counted toward X/Y. At the model layer, `assign_next_walkin_id` locks the **Event then the Registration** (Event-first order) and **rejects an already-numbered row or a cross-event call**, so a duplicate/concurrent admit cannot overwrite an assigned ID or consume another event's counter. The `1..999` (lottery) / `>=1000` (staff) range↔source invariant is **DB-enforced** by a `CheckConstraint` on `Registration` (a backstop to `clean()`, which `save()`/`create()`/`update()` bypass). |
 | TC-046 | I | The owner's chosen language (EN/ES) is persisted on the registration and is the language used for both SMS touchpoints. |
 | TC-047 | I | **Deterministic:** at `count == Z`, a new signup is rejected with an EN/ES "registration full" message; at `Z-1`, a single new signup is accepted; an existing owner at the event can still add an animal regardless of Z. **Soft-cap race (residual/load, not a unit assertion):** Z is a soft cap — the check + insert are not serialized, so concurrent signups at `Z-1` may overshoot by up to the number of requests in flight at the boundary. There is no hard ≤Z invariant; the overshoot is observed/verified under load, not asserted as a deterministic bound (R-10/Decision 12). |
 | TC-048 | I | Admin deletes an event → all of its registrations + animals are gone; a confirmation was shown first; unrelated events are untouched. |
@@ -144,7 +144,7 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
 - **Attendance:** TC-043 verifies printing records attendance (FR-35).
 - **Walk-in add & admit (both roles, post-lottery):** TC-044 (walk-in add) and TC-045 (admit an
   existing `registered`/`not_selected` row) cover FR-36/FR-37; both auto-assign the next **1000+ ID**
-  (`allocate_staff_animal_id`; not counted toward X/Y) and set `status='selected'`, post-lottery only;
+  (`assign_next_walkin_id`; not counted toward X/Y) and set `status='selected'`, post-lottery only;
   available to admin **and** volunteer.
 - **Privileges (Decision 16):** TC-034 verifies the differentiated contract — volunteer can do all
   clinic operations but is denied each Admin-only capability (event create/configure/delete, run
@@ -167,5 +167,9 @@ Types: **U**nit, **I**ntegration, **E2E** (browser/end-to-end), **M**anual, **D*
   (TC-004, TC-007, TC-008, TC-014, TC-016, TC-017, TC-018, TC-019, TC-031, TC-032, TC-039, TC-041,
   TC-043, TC-044, TC-045, TC-046, TC-047, TC-048, TC-049, TC-050, TC-051, TC-052, TC-053, TC-054,
   TC-055, TC-056, TC-058, TC-059) should be automated. The locking tests (TC-047, TC-049, TC-050,
-  TC-058) require PostgreSQL. E2E (browser) and manual/deploy tests (incl. TC-057) are run before
-  each release.
+  TC-058) require PostgreSQL. The row-lock guarantees in `assign_next_walkin_id` (unique monotonic
+  staff allocation; duplicate/concurrent-admit serialization) and `Event.transition()` (locked
+  lifecycle change) are likewise only provable on PostgreSQL — the SQLite suite verifies their
+  *logic* serially only. This concurrency coverage is a **known, business-accepted testing gap**
+  (Decision 18), to be closed when a PostgreSQL CI job is added. E2E (browser) and manual/deploy
+  tests (incl. TC-057) are run before each release.
