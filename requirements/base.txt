@@ -1,0 +1,19 @@
+# Core web framework + WSGI server
+Django>=5.2,<5.3
+gunicorn>=23,<25
+
+# Database (Postgres driver; dev falls back to SQLite via the DATABASE_URL default)
+psycopg[binary]>=3.2,<4
+dj-database-url>=2.3,<3
+django-environ>=0.11,<1
+
+# Serving / static
+whitenoise>=6.7,<7
+
+# Domain dependencies
+django-timezone-field>=7.0,<8   # per-event IANA timezone select
+phonenumbers>=8.13,<9           # US phone validate + E.164 normalize
+qrcode>=7.4,<8                  # flyer QR codes
+Pillow>=10.4,<12                # QR -> JPG rendering
+openpyxl>=3.1,<4                # XLSX export
+twilio>=9.4,<10                 # SMS (signup confirmation + lottery result)
