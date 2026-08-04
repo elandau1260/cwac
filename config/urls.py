@@ -16,7 +16,7 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.http import HttpResponse
-from django.urls import path, reverse_lazy
+from django.urls import include, path, reverse_lazy
 from django.views.generic import RedirectView
 
 
@@ -30,5 +30,7 @@ urlpatterns = [
     # itself isn't a page anyone needs to land on, so point the bare domain at login.
     path("", RedirectView.as_view(url=reverse_lazy("admin:index")), name="home"),
     path("healthz/", healthz, name="healthz"),
+    path("accounts/", include("accounts.urls")),
+    path("events/", include("events.urls")),
     path("admin/", admin.site.urls),
 ]

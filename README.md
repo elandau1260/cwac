@@ -4,7 +4,8 @@ Django backend for the CWAC pre-registration system: a fair lottery replaces "fi
 and owner/pet info is collected ahead of time so check-in is fast and labels print.
 
 > Full spec lives in [`Documents/`](Documents/) — `ImplementationPlan.md` is the authoritative,
-> phased build plan. **Phase 0 (scaffolding) is complete; Phase 1 (models + admin) is next.**
+> phased build plan. **Phases 0 and 1 are complete; the current branch implements Phase 2
+> (staff auth, event management, signup URL, and QR download).**
 
 ---
 

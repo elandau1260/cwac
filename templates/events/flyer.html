@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}{{ event.name }} signup flyer | CWAC{% endblock %}
+
+{% block content %}
+<main>
+    <p><a href="{% url 'admin:events_event_change' event.pk %}">Back to event</a></p>
+    <h1>{{ event.name }}</h1>
+    <p>{{ event.date }}{% if event.location %} · {{ event.location }}{% endif %}</p>
+    {% if event.description %}<p>{{ event.description }}</p>{% endif %}
+
+    <h2>Signup URL</h2>
+    <p><a href="{{ signup_url }}">{{ signup_url }}</a></p>
+
+    <h2>QR code</h2>
+    <p>
+        <img src="{% url 'events:qr_download' event.pk %}" alt="QR code for {{ event.name }} signup">
+    </p>
+    <p>
+        <a href="{% url 'events:qr_download' event.pk %}?download=1">Download QR JPG</a>
+    </p>
+
+    <form method="post" action="{% url 'accounts:logout' %}">
+        {% csrf_token %}
+        <button type="submit">Log out</button>
+    </form>
+</main>
+{% endblock %}

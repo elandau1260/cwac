@@ -7,17 +7,18 @@ completed``). The open/closed state an owner experiences is **computed** from
 never stored as a boolean — so the admin always sees reality with no cron and no
 manual lock (Decision 8 / R-3).
 
-Phase 1 (this file): the model, the read-time window helpers, the soft applicant
-cap ``z_applicants``, the per-event ``timezone`` (IANA), the noon day-after-close
-:meth:`auto_run_deadline`, and the atomic forward-only :meth:`transition`. The
-custom admin form that edits ``open_at``/``close_at`` in the event's timezone
-lives in ``events/admin.py``.
+Phase 1 introduced the model, read-time window helpers, soft applicant cap,
+per-event timezone, noon day-after-close deadline, and atomic forward-only
+transition. Phase 2 adds automatic unique slug generation. The custom admin
+form that edits ``open_at``/``close_at`` in the event's timezone lives in
+``events/admin.py``.
 """
 import datetime
 import logging
 
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
+from django.utils.text import slugify
 
 from timezone_field import TimeZoneField
 
@@ -56,8 +57,9 @@ class Event(models.Model):
     slug = models.SlugField(
         max_length=40,
         unique=True,
+        blank=True,
         help_text="Unique URL code for this clinic (e.g. 'oak-aug-2026'). "
-        "Phase 2 auto-generates this; in the back office it can be typed.",
+        "Leave blank to generate it from the event name.",
     )
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True, default="")
@@ -127,6 +129,46 @@ class Event(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.date})"
+
+    def save(self, *args, **kwargs):
+        """Save the event, generating a stable unique slug when omitted.
+
+        Admins may still supply an explicit slug. For an omitted slug, use the
+        slugified event name and then ``-2``, ``-3``, ... as needed. The
+        existence check keeps the ordinary path inexpensive; the nested
+        transaction/savepoint plus ``IntegrityError`` retry closes the race in
+        which two requests choose the same candidate concurrently (FR-2).
+
+        Only a confirmed slug collision is retried. Any other integrity error
+        is re-raised so invalid event data is never disguised as a slug issue.
+        """
+        if self.slug:
+            return super().save(*args, **kwargs)
+
+        max_length = self._meta.get_field("slug").max_length
+        base = slugify(self.name)[:max_length].strip("-") or "event"
+        sequence = 1
+
+        while True:
+            suffix = "" if sequence == 1 else f"-{sequence}"
+            candidate = f"{base[: max_length - len(suffix)].rstrip('-')}{suffix}"
+            sequence += 1
+
+            if type(self).objects.filter(slug=candidate).exists():
+                continue
+
+            self.slug = candidate
+            try:
+                # A savepoint makes it safe to inspect/retry after a unique
+                # violation even when the caller has an outer atomic block.
+                with transaction.atomic():
+                    return super().save(*args, **kwargs)
+            except IntegrityError:
+                # If this candidate now exists, a concurrent insert won the
+                # race. Otherwise the failure came from another constraint.
+                if not type(self).objects.filter(slug=candidate).exists():
+                    raise
+                self.slug = ""
 
     # --- Services -----------------------------------------------------------
     @property
