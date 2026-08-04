@@ -115,5 +115,11 @@ Record of product decisions. ✅ = confirmed; 🔶 = recommended, awaiting your 
 
 ---
 
+## Decision 18 — PostgreSQL concurrency testing deferred (business-accepted gap)
+**Decision:** The row-lock guarantees in `Registration.assign_next_walkin_id` (unique monotonic staff-ID allocation; duplicate/concurrent-admit serialization) and `Event.transition()` (locked, forward-only lifecycle change) rely on `select_for_update()`, which **SQLite no-ops**. The automated suite therefore verifies their **logic serially only**; true concurrent behavior is only provable on **PostgreSQL**, and there is currently no PostgreSQL CI job. The business **accepts this as a known testing gap for Phase 1** — the design is sound and the logic is covered; closing the gap (a PostgreSQL `TransactionTestCase`/CI job with concurrent allocator calls, including two admits of the same registration) is deferred to a follow-up infra task. Reflected in `TraceabilityMatrix.md` (test-automation/residual note), alongside the existing TC-047/TC-049/TC-050/TC-058 "requires PostgreSQL" residuals.
+**Your answer:** ✅ Confirmed — defer and document; concurrency coverage is a business-accepted known gap.
+
+---
+
 ## Summary
-Decisions 1–17 are all confirmed — **no open items remain for V1**. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, applicant cap Z (Decisions 10–12), owner status-visibility/SMS consent (Decision 14), SMS delivery/STOP-START (Decision 15), and the Admin/volunteer privilege split (Decision 16) are reflected in Requirements/Architecture/Traceability as **FR-30, FR-38..FR-43**. Animal sex is optional (Decision 17) is reflected as **FR-8/TC-009**.
+Decisions 1–18 are all confirmed — **no open items remain for V1**. AnimalIDs start at **1** (Decision 4). The hybrid lottery trigger, event deletion, applicant cap Z (Decisions 10–12), owner status-visibility/SMS consent (Decision 14), SMS delivery/STOP-START (Decision 15), and the Admin/volunteer privilege split (Decision 16) are reflected in Requirements/Architecture/Traceability as **FR-30, FR-38..FR-43**. Animal sex is optional (Decision 17) is reflected as **FR-8/TC-009**. PostgreSQL concurrency testing is deferred as a business-accepted gap (Decision 18).

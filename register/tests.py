@@ -326,3 +326,51 @@ class RegistrationPartialUniqueIndexTest(TestCase):
         make_registration(e1, animal_id=7, id_source="lottery")
         make_registration(e2, animal_id=7, id_source="lottery")  # OK
         self.assertEqual(Registration.objects.filter(animal_id=7).count(), 2)
+
+
+class RegistrationIdRangeSourceConstraintTest(TestCase):
+    """Finding 2: the range<->source invariant is DB-enforced, so it holds even
+    when clean()/full_clean() is bypassed (save/create/update)."""
+
+    def setUp(self):
+        self.event = make_event()
+
+    def _create(self, **overrides):
+        defaults = dict(
+            event=self.event, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        defaults.update(overrides)
+        return Registration.objects.create(**defaults)
+
+    def test_null_id_null_source_ok(self):
+        self._create()  # pre-lottery row
+        self._create()  # multiple NULL pairs allowed
+
+    def test_lottery_in_range_ok(self):
+        self._create(animal_id=1, id_source="lottery")
+        self._create(animal_id=999, id_source="lottery")
+
+    def test_staff_in_range_ok(self):
+        self._create(animal_id=1000, id_source="staff")
+        self._create(animal_id=5000, id_source="staff")
+
+    def test_lottery_id_above_999_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=1000, id_source="lottery")
+
+    def test_staff_id_below_1000_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=7, id_source="staff")
+
+    def test_id_without_source_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=5, id_source=None)
+
+    def test_source_without_id_rejected_by_db(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._create(animal_id=None, id_source="lottery")

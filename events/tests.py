@@ -23,7 +23,7 @@ from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
 
-from events.admin import EventAdminForm
+from events.admin import EventAdmin, EventAdminForm
 from events.models import Event, InvalidTransition
 
 
@@ -276,6 +276,42 @@ class EventSlugUniqueTest(TestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 make_event(slug="dupe")
+
+
+class EventAdminSignupStateTest(TestCase):
+    """Finding 1: the admin shows the *computed* signup window (FR-4), not the
+    raw lifecycle stage — so a `live` event whose window has closed (but the
+    lottery hasn't run) reads 'Closed', never 'open for signups'."""
+
+    def _admin(self):
+        from django.contrib import admin
+
+        return EventAdmin(Event, admin.site)
+
+    def test_live_label_is_just_live(self):
+        # The stage label no longer claims "open for signups"; that signal now
+        # lives in the computed column.
+        self.assertEqual(Event.Status.LIVE.label, "Live")
+
+    def test_open_when_live_and_in_window(self):
+        e = make_event(status=Event.Status.LIVE)
+        self.assertEqual(self._admin().signup_state(e), "Open")
+
+    def test_closed_after_window_even_while_live(self):
+        # The case the audit flagged: status is still 'live', but close_at has
+        # passed and the lottery hasn't run -> signups are closed.
+        now = timezone.now()
+        e = make_event(
+            status=Event.Status.LIVE,
+            open_at=now - timedelta(hours=2),
+            close_at=now - timedelta(hours=1),
+        )
+        self.assertFalse(e.signup_open())  # sanity: window really closed
+        self.assertEqual(self._admin().signup_state(e), "Closed")
+
+    def test_closed_for_draft(self):
+        e = make_event()  # status defaults to draft
+        self.assertEqual(self._admin().signup_state(e), "Closed")
 
 
 class EventAdminRenderSmokeTest(TestCase):

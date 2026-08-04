@@ -132,7 +132,9 @@ migration is made.
 - `created_by_user` FK(`accounts.User`, null=True) — the staff User that created a `staff`-source row (null for `public`)
 - `admitted_by_user` FK(`accounts.User`, null=True) + `admitted_at` DateTimeField(null=True) — set when staff **admit** an existing `public` row (assign a 1000+ ID); the row's `creation_source`/`created_by_user` are left untouched
 - `created_at`, `updated_at`
-- **Meta.constraints:** `UniqueConstraint(fields=[event, animal_id], condition=Q(animal_id__isnull=False))`
+- **Meta.constraints:**
+  - `UniqueConstraint(fields=[event, animal_id], condition=Q(animal_id__isnull=False))` — event-unique IDs (multiple NULLs allowed)
+  - `CheckConstraint` — **DB-enforced range↔source** invariant (Requirements §7.4): allows exactly `(NULL, NULL)`, lottery `1..999`, or staff `>=1000`; guards with explicit `isnull` checks so SQL three-valued logic can't let a half-set row pass. Backstops `clean()` (which `save()`/`create()`/`update()` bypass).
 - **classmethod** `next_animal_id(event)` = (max non-null `animal_id` in event, **lottery range 1..999 only**)+1, else 1 — used by the lottery only
 - **classmethod** `assign_next_walkin_id(event, reg)` — under `transaction.atomic()`, **locks + reloads the `Event` row then the `Registration` row (Event-first consistent order)**, reads `event.next_staff_id`, assigns it to `reg` (`id_source='staff'`), increments `event.next_staff_id`, saves both — atomic, so no `max()+1` race and no deleted-highest-ID reuse. It **rejects** (a) a `reg` from a **different event** (no cross-counter consumption), (b) a `reg` that is **already numbered** (already-assigned IDs are never edited — a duplicate/concurrent admit fails rather than overwriting), and (c) an unsaved `event`/`reg`. The caller's stale instances are refreshed from the committed rows.
 - **property** `is_attended` = `printed_at is not None`

@@ -180,6 +180,34 @@ class Registration(models.Model):
                 condition=models.Q(animal_id__isnull=False),
                 name="unique_animal_id_per_event",
             ),
+            # DB-enforced range<->source invariant (Requirements §7.4: "The
+            # database enforces 1–999 (lottery) and >=1000 (staff)"). clean()
+            # gives friendly form errors, but save()/create()/update() bypass
+            # full_clean(), so this backstop rejects every invalid combination
+            # at the database: exactly (NULL, NULL), lottery 1..999, or staff
+            # >=1000. The explicit ``isnull`` guards are required so that a
+            # half-set row (id without source, or vice-versa) resolves to
+            # FALSE, not SQL NULL (which a CHECK constraint treats as a pass).
+            models.CheckConstraint(
+                condition=(
+                    models.Q(animal_id__isnull=True, id_source__isnull=True)
+                    | (
+                        models.Q(animal_id__isnull=False, id_source__isnull=False)
+                        & (
+                            models.Q(
+                                id_source="lottery",
+                                animal_id__gte=LOTTERY_ANIMAL_ID_MIN,
+                                animal_id__lte=LOTTERY_ANIMAL_ID_MAX,
+                            )
+                            | models.Q(
+                                id_source="staff",
+                                animal_id__gte=STAFF_ANIMAL_ID_MIN,
+                            )
+                        )
+                    )
+                ),
+                name="animal_id_source_range_valid",
+            ),
         ]
 
     def __str__(self):

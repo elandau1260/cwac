@@ -133,6 +133,7 @@ class EventAdmin(admin.ModelAdmin):
         "date",
         "timezone",
         "status",
+        "signup_state",
         "registration_count",
         "lottery_run_at",
     )
@@ -179,3 +180,12 @@ class EventAdmin(admin.ModelAdmin):
     @admin.display(description="Registrations")
     def registration_count(self, obj):
         return obj.registrations.count()
+
+    @admin.display(description="Signups")
+    def signup_state(self, obj):
+        """The *actual* signup window right now (FR-4), computed from
+        ``signup_open()`` — independent of the lifecycle ``status``. ``status``
+        is the stage (Draft/Live/Lottery run/…); this column says whether
+        signups are accepted at this moment, so a ``live`` event whose window
+        has closed (or hasn't opened) shows "Closed", not "open for signups"."""
+        return "Open" if obj.signup_open() else "Closed"

@@ -47,7 +47,7 @@ class Event(models.Model):
         # Order matters: ``transition()`` only allows advancing exactly one step
         # down this list (draft → live → lottery_run → active → completed).
         DRAFT = "draft", "Draft"
-        LIVE = "live", "Live (open for signups)"
+        LIVE = "live", "Live"
         LOTTERY_RUN = "lottery_run", "Lottery run"
         ACTIVE = "active", "Active (clinic day)"
         COMPLETED = "completed", "Completed"
