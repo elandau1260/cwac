@@ -214,14 +214,39 @@ class Registration(models.Model):
         tag = f"#{self.animal_id}" if self.animal_id else "—"
         return f"{tag} {self.first_name} {self.last_name} ({self.event})"
 
+    def _db_event_id(self):
+        """The ``event_id`` currently persisted for this row, or ``None``.
+
+        ``None`` means the row isn't in the DB yet (unsaved) or was concurrently
+        deleted — in either case there is no prior event to be immutable from.
+        """
+        if self.pk is None:
+            return None
+        return (
+            type(self).objects.filter(pk=self.pk)
+            .values_list("event_id", flat=True)
+            .first()
+        )
+
     def clean(self):
-        """Cross-check ``animal_id`` range against ``id_source``.
+        """Validate ``animal_id`` range↔source and event immutability.
 
         Lottery ⇒ 1..999; staff ⇒ >=1000. Since ``1..999 ∪ >=1000`` covers every
         positive integer, the range alone cannot prove the allocator, so both
         must agree (the partial unique index guarantees event-uniqueness).
+
+        A persisted registration is also **locked to its event**: reparenting it
+        to another event would strand the destination event's ID sequence
+        (FR-14/FR-37/TC-045). The admin renders ``event`` read-only on change
+        forms; this is the friendly form-level guard, with :meth:`save` as the
+        backstop for every non-admin path.
         """
         super().clean()
+        original_event_id = self._db_event_id()
+        if original_event_id is not None and original_event_id != self.event_id:
+            raise ValidationError(
+                {"event": "A registration cannot be moved to another event."}
+            )
         if self.animal_id is not None:
             if self.id_source == self.IdSource.LOTTERY:
                 if not (LOTTERY_ANIMAL_ID_MIN <= self.animal_id <= LOTTERY_ANIMAL_ID_MAX):
@@ -241,6 +266,28 @@ class Registration(models.Model):
             raise ValidationError(
                 {"id_source": "id_source is set but animal_id is not."}
             )
+
+    def save(self, *args, **kwargs):
+        """Persist, enforcing that a registration's ``event`` never changes.
+
+        Once a row exists, its event is **immutable** (FR-14/FR-37/TC-045): a
+        registration belongs to exactly one event for its entire lifetime.
+        Reparenting would strand the destination event's ID sequence — e.g. a
+        staff-numbered row (ID 1000) moved into a fresh event leaves that
+        event's ``next_staff_id`` at 1000, so every later walk-in collides on
+        ``unique_animal_id_per_event`` and rolls back. :meth:`clean` gives the
+        admin a friendly error, but ``save()``/``create()``/``update()`` bypass
+        ``full_clean()``, so this guard backstops every code path. To put an
+        owner in another event, add a new row there.
+        """
+        if not self._state.adding:
+            original_event_id = self._db_event_id()
+            if original_event_id is not None and original_event_id != self.event_id:
+                raise ValueError(
+                    "Cannot change a registration's event: a registration is "
+                    "locked to the event it was created for."
+                )
+        super().save(*args, **kwargs)
 
     @property
     def is_attended(self):

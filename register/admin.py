@@ -62,6 +62,17 @@ class RegistrationAdmin(admin.ModelAdmin):
     )
     autocomplete_fields = ("event", "created_by_user")
 
+    def get_readonly_fields(self, request, obj=None):
+        # `event` is editable when adding a row (staff pick the event for a
+        # walk-in), but read-only once the row exists: a registration is locked
+        # to the event it was created for (FR-14/FR-37/TC-045). The model's
+        # clean()/save() enforce this server-side; read-only just keeps the
+        # back-office from even trying to reparent through the UI.
+        readonly = list(self.readonly_fields)
+        if obj is not None and "event" not in readonly:
+            readonly.append("event")
+        return readonly
+
     fieldsets = (
         (None, {"fields": ("event", "status", "language")}),
         ("Owner", {"fields": ("first_name", "last_name", "phone", "email", "address")}),

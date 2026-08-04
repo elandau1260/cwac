@@ -12,12 +12,14 @@ Covers:
 import zoneinfo
 from datetime import timedelta
 
+from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
 
 from events.models import Event
+from register.admin import RegistrationAdmin
 from register.models import (
     Animal,
     Registration,
@@ -374,3 +376,94 @@ class RegistrationIdRangeSourceConstraintTest(TestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 self._create(animal_id=None, id_source="lottery")
+
+
+class RegistrationEventImmutabilityTest(TestCase):
+    """A persisted registration's event is immutable (FR-14/FR-37/TC-045).
+
+    Once a row exists for an event it is locked to that event — the Django admin
+    exposes ``event`` read-only on change forms and ``clean()``/``save()`` reject
+    any reassignment. This is what prevents a numbered row moved into a fresh
+    event from stranding that event's allocation sequence.
+    """
+
+    def test_save_rejects_event_change(self):
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        r.event = e2
+        with self.assertRaises(ValueError):
+            r.save()
+        # The DB row is unchanged.
+        r.refresh_from_db()
+        self.assertEqual(r.event_id, e1.pk)
+
+    def test_save_rejects_event_change_on_numbered_row(self):
+        # The audit scenario: a staff-numbered row cannot be reparented.
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        Registration.assign_next_walkin_id(e1, r)  # r -> 1000
+        r.event = e2
+        with self.assertRaises(ValueError):
+            r.save()
+        r.refresh_from_db()
+        self.assertEqual(r.event_id, e1.pk)
+        self.assertEqual(r.animal_id, 1000)
+
+    def test_clean_rejects_event_change(self):
+        # Friendly form-level guard (admin change forms call full_clean()).
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")
+        r = make_registration(e1)
+        r.event = e2
+        with self.assertRaises(ValidationError):
+            r.full_clean()
+
+    def test_create_can_choose_any_event(self):
+        # The guard only fires on updates; new rows freely select an event.
+        e = make_event()
+        r = Registration.objects.create(
+            event=e, first_name="A", last_name="B", phone="+1",
+            email="a@b.com", address="x",
+        )
+        self.assertEqual(r.event_id, e.pk)
+
+    def test_saving_other_fields_in_same_event_is_allowed(self):
+        # Updating unrelated fields on a row that stays in its event is fine.
+        e = make_event()
+        r = make_registration(e)
+        r.first_name = "Changed"
+        r.save(update_fields=["first_name"])
+        r.refresh_from_db()
+        self.assertEqual(r.first_name, "Changed")
+        self.assertEqual(r.event_id, e.pk)
+
+    def test_admin_change_form_marks_event_readonly(self):
+        # `event` is editable on add but read-only once the row exists, so the
+        # back-office cannot reparent a registration through the UI either.
+        site = admin.sites.AdminSite()
+        modeladmin = RegistrationAdmin(Registration, site)
+        self.assertNotIn(
+            "event", modeladmin.get_readonly_fields(request=None, obj=None)
+        )
+        r = make_registration(make_event())
+        self.assertIn("event", modeladmin.get_readonly_fields(request=None, obj=r))
+
+    def test_cannot_strand_another_events_counter(self):
+        # End-to-end guarantee from the audit: a numbered row moved into a fresh
+        # event B must NOT leave B's next_staff_id stranded below a moved ID.
+        e1 = make_event(slug="event-one")
+        e2 = make_event(slug="event-two")  # next_staff_id defaults to 1000
+        r = make_registration(e1)
+        Registration.assign_next_walkin_id(e1, r)  # r -> 1000 (in e1)
+        r.event = e2  # attempt to reparent into e2
+        with self.assertRaises(ValueError):
+            r.save()
+        # e2's counter is untouched, and a legitimate walk-in in e2 still gets
+        # the correct first ID (not stranded above the moved row's ID).
+        e2.refresh_from_db()
+        self.assertEqual(e2.next_staff_id, 1000)
+        r2 = make_registration(e2)
+        Registration.assign_next_walkin_id(e2, r2)
+        self.assertEqual(r2.animal_id, 1000)
